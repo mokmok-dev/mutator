@@ -83,6 +83,10 @@ the gate to stay inside a few seconds.
 
 `mutator` calls the `cargo` and `cargo-mutants` on your `PATH` rather than bundling them, so the version in your devShell is the one that runs.
 
+### Development
+
+`nix develop` gives you the toolchain, `cargo-mutants`, `cargo-nextest`, and the linters. `nix fmt` formats; `nix flake check` runs every check, one per linter, so a failure names the tool that failed.
+
 ### Agent skills
 
 The repository ships skills under [`skills/`](skills/), so an agent can close the gaps this tool finds:

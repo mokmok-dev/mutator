@@ -115,19 +115,37 @@
                 inherit cargoArtifacts;
               }
             );
+
+            # One check per linter, so a failure names the tool. They come from the
+            # same set the formatter runs, so `nix fmt` and CI cannot disagree.
+            actionlint = pkgs.runCommandLocal "actionlint" { nativeBuildInputs = [ pkgs.actionlint ]; } ''
+              actionlint -color ${./.}/.github/workflows/*.yaml
+              touch $out
+            '';
+            deadnix = pkgs.runCommandLocal "deadnix" { nativeBuildInputs = [ pkgs.deadnix ]; } ''
+              deadnix --fail ${./.}
+              touch $out
+            '';
+            statix = pkgs.runCommandLocal "statix" { nativeBuildInputs = [ pkgs.statix ]; } ''
+              statix check ${./.}
+              touch $out
+            '';
           };
 
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [ config.treefmt.build.devShell ];
 
             packages = with pkgs; [
+              actionlint
               cargo-mutants
               cargo-nextest
               config.treefmt.build.wrapper
+              deadnix
               linkerPackages
               rustToolchain
               sccache
               skills
+              statix
             ];
 
             shellHook = ''
@@ -141,13 +159,12 @@
             inherit mutator;
           };
 
+          # Formatting only. The linters live in `checks`, so `nix fmt` never
+          # rewrites code and a lint failure names the tool.
           treefmt = {
             projectRootFile = "flake.nix";
             programs = {
-              actionlint.enable = true;
-              deadnix.enable = true;
               nixfmt.enable = true;
-              statix.enable = true;
             };
           };
         };
