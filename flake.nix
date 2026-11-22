@@ -3,8 +3,6 @@
     nixpkgs.url = "github:NixOS/nixpkgs";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
-    git-hooks.url = "github:cachix/git-hooks.nix";
-    git-hooks.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     rust-overlay.url = "github:oxalica/rust-overlay";
@@ -16,7 +14,6 @@
     {
       nixpkgs,
       flake-parts,
-      git-hooks,
       treefmt-nix,
       rust-overlay,
       crane,
@@ -24,7 +21,6 @@
     }@inputs:
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
-        git-hooks.flakeModule
         treefmt-nix.flakeModule
       ];
 
@@ -122,11 +118,12 @@
           };
 
           devShells.default = pkgs.mkShellNoCC {
-            inputsFrom = [ config.pre-commit.devShell ];
+            inputsFrom = [ config.treefmt.build.devShell ];
 
             packages = with pkgs; [
               cargo-mutants
               cargo-nextest
+              config.treefmt.build.wrapper
               linkerPackages
               rustToolchain
               sccache
@@ -144,18 +141,13 @@
             inherit mutator;
           };
 
-          pre-commit.settings = {
-            hooks = {
-              actionlint.enable = true;
-              deadnix.enable = true;
-              statix.enable = true;
-            };
-          };
-
           treefmt = {
             projectRootFile = "flake.nix";
             programs = {
+              actionlint.enable = true;
+              deadnix.enable = true;
               nixfmt.enable = true;
+              statix.enable = true;
             };
           };
         };
