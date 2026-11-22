@@ -43,6 +43,44 @@ From a checkout, `nix build` and `nix run . -- --version` do the same. `nix deve
 
 Supported systems are `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`. Nixpkgs 26.11 dropped `x86_64-darwin`, so Intel Macs are not covered.
 
+### As a flake-parts module
+
+`flakeModules.default` configures a whole project from `perSystem`. Import it and set
+`perSystem.mutator`:
+
+```nix
+{
+  inputs.mutator.url = "github:mokmok-dev/mutator";
+  inputs.mutator.inputs.nixpkgs.follows = "nixpkgs";
+
+  outputs = inputs: inputs.flake-parts.lib.mkFlake { inherit inputs; } {
+    systems = [ "x86_64-linux" "aarch64-darwin" ];
+    imports = [ inputs.mutator.flakeModules.default ];
+    perSystem.mutator = {
+      enable = true;
+      check = true;
+    };
+  };
+}
+```
+
+| option | default | effect |
+|---|---|---|
+| `mutator.enable` | `false` | adds `packages.mutator`, `packages.default`, and `apps.mutator` |
+| `mutator.check` | `true` | adds `checks.mutator`, so `nix flake check` runs the mutation gate |
+| `mutator.source` | `self` | the project to test; its `Cargo.lock` must be committed |
+| `mutator.args` | `[ "--all" "--fail-on-survived" ]` | arguments for the check |
+| `mutator.jobs` | `4` | `--jobs` for the check |
+| `mutator.package` | the input's binary | override the binary |
+
+With this, `nix flake check` runs the same gate as CI, fully offline and reproducible. The
+check copies the source, so `cargo-mutants` can mutate it, and it runs `--all`: a sandbox
+has no `git` history to diff against.
+
+The tradeoff is cost. `checks.mutator` runs every mutant with a cold cache, so it takes
+minutes on a large crate. Set `check = false` and keep the `--cache` CI job when you want
+the gate to stay inside a few seconds.
+
 `mutator` calls the `cargo` and `cargo-mutants` on your `PATH` rather than bundling them, so the version in your devShell is the one that runs.
 
 ### Agent skills

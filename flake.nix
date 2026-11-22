@@ -28,6 +28,12 @@
         treefmt-nix.flakeModule
       ];
 
+      flake = {
+        # `imports = [ inputs.mutator.flakeModules.default ]` then
+        # `perSystem.mutator = { enable = true; check = true; };`
+        flakeModules.default = ./nix/mutator-module.nix;
+      };
+
       perSystem =
         {
           config,
