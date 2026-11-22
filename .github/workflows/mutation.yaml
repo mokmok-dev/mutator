@@ -43,15 +43,26 @@ jobs:
         run: nix develop --command ./target/debug/mutator --cache --fail-on-survived
 
   # The flake exposes the binary as `packages.<system>.default` and as
-  # `apps.<system>.default`, so a consumer can take it as an input.
+  # `apps.<system>.default`, so a consumer can take it as an input. Every system
+  # the flake declares is built here, so a platform regression cannot land.
   package:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-latest
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: DeterminateSystems/nix-installer-action@129f07902485941992791c670de648dbe572a9ac # v3
-      - run: nix build .#default
-      - run: nix run . -- --version
+      - run: nix build .#packages.${{ matrix.system }}.default
+      - run: nix run .#packages.${{ matrix.system }}.default -- --version
 
   # The tool's reason to exist: PRs run only the mutants their diff can affect.
   diff:

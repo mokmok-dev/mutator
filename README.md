@@ -41,6 +41,8 @@ packages = [ inputs.mutator.packages.${system}.default ];
 
 From a checkout, `nix build` and `nix run . -- --version` do the same. `nix develop` gives you the toolchain, `cargo-mutants`, and `cargo-nextest`.
 
+Supported systems are `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`. Nixpkgs 26.11 dropped `x86_64-darwin`, so Intel Macs are not covered.
+
 `mutator` calls the `cargo` and `cargo-mutants` on your `PATH` rather than bundling them, so the version in your devShell is the one that runs.
 
 ### Agent skills
