@@ -8,8 +8,10 @@ on:
       - main
 
 concurrency:
+  # Cancel superseded pull request runs. A push to `main` is left alone: it is the
+  # run that saves the verdict cache, and cancelling it loses that work.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
