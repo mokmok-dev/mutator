@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use serde::Serialize;
 
 use crate::accept::Accepted;
+use crate::error::{Error, Result};
 use crate::mutant::{Mutant, MutantId};
 
 /// What one `cargo-mutants` run said about a mutant.
@@ -19,14 +20,16 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    fn parse(summary: &str) -> anyhow::Result<Self> {
+    fn parse(summary: &str) -> Result<Self> {
         match summary {
             "CaughtMutant" => Ok(Self::Caught),
             "MissedMutant" => Ok(Self::Missed),
             "Timeout" => Ok(Self::Timeout),
             "Unviable" => Ok(Self::Unviable),
             "Failure" => Ok(Self::Failure),
-            other => anyhow::bail!("unknown cargo-mutants summary {other:?}"),
+            other => Err(Error::UnknownSummary {
+                summary: other.to_owned(),
+            }),
         }
     }
 }
@@ -55,12 +58,12 @@ enum ScenarioKind {
     Mutant { name: String },
 }
 
-fn lab(json: &str) -> anyhow::Result<Lab> {
-    serde_json::from_str(json).map_err(|err| anyhow::anyhow!("parse outcomes.json: {err}"))
+fn lab(json: &str) -> Result<Lab> {
+    serde_json::from_str(json).map_err(|source| Error::Outcomes { source })
 }
 
 /// Every scenario in `mutants.out/outcomes.json`, split by kind.
-fn scenarios(json: &str) -> anyhow::Result<impl Iterator<Item = (bool, String, String)> + '_> {
+fn scenarios(json: &str) -> Result<impl Iterator<Item = (bool, String, String)> + '_> {
     Ok(lab(json)?.outcomes.into_iter().map(|scenario| {
         let is_mutant = !matches!(scenario.scenario, ScenarioKind::Baseline);
         let name = match scenario.scenario {
@@ -76,7 +79,7 @@ fn scenarios(json: &str) -> anyhow::Result<impl Iterator<Item = (bool, String, S
 /// # Errors
 ///
 /// Returns when the file is not the documented lab outcome or holds an unknown summary.
-pub fn parse_outcomes(json: &str) -> anyhow::Result<Vec<Record>> {
+pub fn parse_outcomes(json: &str) -> Result<Vec<Record>> {
     scenarios(json)?
         .filter(|(is_mutant, _, _)| *is_mutant)
         .map(|(_, name, summary)| {
@@ -93,7 +96,7 @@ pub fn parse_outcomes(json: &str) -> anyhow::Result<Vec<Record>> {
 /// # Errors
 ///
 /// Returns when the file is not the documented lab outcome.
-pub fn baseline_failed(json: &str) -> anyhow::Result<bool> {
+pub fn baseline_failed(json: &str) -> Result<bool> {
     Ok(scenarios(json)?.any(|(is_mutant, _, summary)| !is_mutant && summary != "Success"))
 }
 
@@ -403,7 +406,7 @@ struct Reused {
 /// # Errors
 ///
 /// Returns when the report cannot be serialized.
-pub fn render_json(summary: &Summary) -> anyhow::Result<String> {
+pub fn render_json(summary: &Summary) -> Result<String> {
     let report = JsonReport {
         schema_version: 1,
         scope: &summary.scope,
@@ -418,8 +421,10 @@ pub fn render_json(summary: &Summary) -> anyhow::Result<String> {
             missed: summary.reused.1,
         },
     };
-    let mut text = serde_json::to_string(&report)
-        .map_err(|err| anyhow::anyhow!("render JSON report: {err}"))?;
+    let mut text = serde_json::to_string(&report).map_err(|source| Error::Serialize {
+        what: "JSON report",
+        source,
+    })?;
     text.push('\n');
     Ok(text)
 }

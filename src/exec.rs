@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::error::{Error, Result};
+
 /// A finished child process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
@@ -23,19 +25,22 @@ pub trait Exec {
     /// # Errors
     ///
     /// Returns when the program cannot be started or its streams cannot be read.
-    fn run(&self, program: &str, args: &[String], cwd: &Path) -> anyhow::Result<Output>;
+    fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<Output>;
 }
 
 /// Runs the real process, capturing both streams.
 pub struct Real;
 
 impl Exec for Real {
-    fn run(&self, program: &str, args: &[String], cwd: &Path) -> anyhow::Result<Output> {
+    fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<Output> {
         let output = Command::new(program)
             .args(args)
             .current_dir(cwd)
             .output()
-            .map_err(|err| anyhow::anyhow!("run {program}: {err}"))?;
+            .map_err(|source| Error::Spawn {
+                program: program.to_owned(),
+                source,
+            })?;
         Ok(Output {
             code: exit_code(output.status),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -75,7 +80,7 @@ pub fn run_args(
     manifest: Option<&Path>,
     jobs: Option<u32>,
     timeout: Option<u64>,
-) -> anyhow::Result<Vec<String>> {
+) -> Result<Vec<String>> {
     let mut args = vec![
         "mutants".to_owned(),
         "--no-times".to_owned(),
@@ -106,9 +111,9 @@ pub fn run_args(
 /// # Errors
 ///
 /// Returns when `names` is empty.
-pub fn select_regex(names: &[&str]) -> anyhow::Result<String> {
+pub fn select_regex(names: &[&str]) -> Result<String> {
     if names.is_empty() {
-        anyhow::bail!("cannot select an empty set of mutants");
+        return Err(Error::EmptySelection);
     }
     let alternatives: Vec<String> = names.iter().map(|name| escape_regex(name)).collect();
     Ok(format!("^(?:{})$", alternatives.join("|")))

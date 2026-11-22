@@ -6,6 +6,7 @@ use std::fmt;
 use serde::Deserialize;
 
 use crate::diff::{Diff, Span};
+use crate::error::{Error, Result};
 
 /// One mutant as `cargo mutants --list --json` reports it.
 #[derive(Debug, Clone, Deserialize)]
@@ -94,9 +95,8 @@ impl From<MutantId> for String {
 /// # Errors
 ///
 /// Returns when the output is not the documented array of mutants.
-pub fn parse_list(json: &str) -> anyhow::Result<Vec<Mutant>> {
-    serde_json::from_str(json)
-        .map_err(|err| anyhow::anyhow!("parse cargo-mutants --list JSON: {err}"))
+pub fn parse_list(json: &str) -> Result<Vec<Mutant>> {
+    serde_json::from_str(json).map_err(|source| Error::ListJson { source })
 }
 
 /// Assign every mutant its id, in input order, numbering same-shaped mutants by source position.

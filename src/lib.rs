@@ -15,6 +15,9 @@ pub mod accept;
 pub mod cache;
 pub mod cli;
 pub mod diff;
+pub mod error;
 pub mod exec;
 pub mod mutant;
 pub mod report;
+
+pub use error::{Error, Result};

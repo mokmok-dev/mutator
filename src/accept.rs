@@ -5,6 +5,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Error, Result};
 use crate::mutant::MutantId;
 
 pub const FILE: &str = "mutator.accepted.json";
@@ -36,11 +37,14 @@ impl Accepted {
     /// # Errors
     ///
     /// Returns when the text is not a version 1 store.
-    pub fn parse(text: &str) -> anyhow::Result<Self> {
+    pub fn parse(text: &str) -> Result<Self> {
         let parsed: Self =
-            serde_json::from_str(text).map_err(|err| anyhow::anyhow!("parse {FILE}: {err}"))?;
+            serde_json::from_str(text).map_err(|source| Error::Accepted { file: FILE, source })?;
         if parsed.version != VERSION {
-            anyhow::bail!("{FILE}: unsupported version {}", parsed.version);
+            return Err(Error::AcceptedVersion {
+                file: FILE,
+                version: parsed.version,
+            });
         }
         Ok(parsed)
     }
@@ -50,9 +54,9 @@ impl Accepted {
     /// # Errors
     ///
     /// Returns when the store cannot be serialized.
-    pub fn render(&self) -> anyhow::Result<String> {
+    pub fn render(&self) -> Result<String> {
         let mut text = serde_json::to_string_pretty(self)
-            .map_err(|err| anyhow::anyhow!("render {FILE}: {err}"))?;
+            .map_err(|source| Error::Serialize { what: FILE, source })?;
         text.push('\n');
         Ok(text)
     }
@@ -74,12 +78,12 @@ impl Accepted {
     /// # Errors
     ///
     /// Returns when the file exists but cannot be read or parsed.
-    pub fn load(root: &Path) -> anyhow::Result<Self> {
+    pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(FILE);
         match std::fs::read_to_string(&path) {
             Ok(text) => Self::parse(&text),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(anyhow::anyhow!("read {}: {err}", path.display())),
+            Err(source) => Err(Error::Read { path, source }),
         }
     }
 
@@ -88,10 +92,9 @@ impl Accepted {
     /// # Errors
     ///
     /// Returns when the file cannot be written.
-    pub fn save(&self, root: &Path) -> anyhow::Result<()> {
+    pub fn save(&self, root: &Path) -> Result<()> {
         let path = root.join(FILE);
-        std::fs::write(&path, self.render()?)
-            .map_err(|err| anyhow::anyhow!("write {}: {err}", path.display()))
+        std::fs::write(&path, self.render()?).map_err(|source| Error::Write { path, source })
     }
 }
 

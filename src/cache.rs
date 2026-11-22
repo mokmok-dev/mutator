@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::error::{Error, Result};
 use crate::exec::Exec;
 
 pub const DIR: &str = "target/mutator-cache";
@@ -136,21 +137,20 @@ impl Store {
     /// # Errors
     ///
     /// Returns when the text is not a version 1 store for this package.
-    pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let store: Self = serde_json::from_str(text)
-            .map_err(|err| anyhow::anyhow!("parse cache entry: {err}"))?;
-        if store.version != VERSION {
-            anyhow::bail!("cache entry has unsupported version {}", store.version);
-        }
+    pub fn parse(text: &str) -> Result<Self> {
+        let store: Self = serde_json::from_str(text).map_err(|source| Error::Cache { source })?;
+        store.check_version()?;
         Ok(store)
     }
 
     /// # Errors
     ///
     /// Returns when the store cannot be serialized.
-    pub fn render(&self) -> anyhow::Result<String> {
-        let mut text = serde_json::to_string_pretty(self)
-            .map_err(|err| anyhow::anyhow!("render cache entry: {err}"))?;
+    pub fn render(&self) -> Result<String> {
+        let mut text = serde_json::to_string_pretty(self).map_err(|source| Error::Serialize {
+            what: "cache entry",
+            source,
+        })?;
         text.push('\n');
         Ok(text)
     }
@@ -159,18 +159,28 @@ impl Store {
     ///
     /// Returns when the store names another version, package, or `cargo-mutants`
     /// release, since its verdicts then came from a different tool.
-    pub fn check(&self, package: &str, cargo_mutants: &str) -> anyhow::Result<()> {
-        if self.version != VERSION {
-            anyhow::bail!("cache entry has unsupported version {}", self.version);
-        }
+    pub fn check(&self, package: &str, cargo_mutants: &str) -> Result<()> {
+        self.check_version()?;
         if self.package != package {
-            anyhow::bail!("cache entry is for package {}, not {package}", self.package);
+            return Err(Error::CachePackage {
+                found: self.package.clone(),
+                expected: package.to_owned(),
+            });
         }
         if self.cargo_mutants != cargo_mutants {
-            anyhow::bail!(
-                "cache entry is for {}, not {cargo_mutants}",
-                self.cargo_mutants
-            );
+            return Err(Error::CacheTool {
+                found: self.cargo_mutants.clone(),
+                expected: cargo_mutants.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    const fn check_version(&self) -> Result<()> {
+        if self.version != VERSION {
+            return Err(Error::CacheVersion {
+                version: self.version,
+            });
         }
         Ok(())
     }
@@ -228,19 +238,15 @@ pub fn load(root: &Path, package: &str, fingerprint: &Fingerprint, cargo_mutants
     }
 }
 
-fn write(
-    root: &Path,
-    package: &str,
-    fingerprint: &Fingerprint,
-    store: &Store,
-) -> anyhow::Result<()> {
+fn write(root: &Path, package: &str, fingerprint: &Fingerprint, store: &Store) -> Result<()> {
     let file = path(root, package, fingerprint);
     if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| anyhow::anyhow!("create {}: {err}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|source| Error::Create {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
-    std::fs::write(&file, store.render()?)
-        .map_err(|err| anyhow::anyhow!("write {}: {err}", file.display()))
+    std::fs::write(&file, store.render()?).map_err(|source| Error::Write { path: file, source })
 }
 
 /// The `cargo-mutants` version, read once per run from the list output.
@@ -248,10 +254,12 @@ fn write(
 /// # Errors
 ///
 /// Returns when `cargo-mutants` cannot report its version.
-pub fn cargo_mutants_version(exec: &dyn Exec, root: &Path) -> anyhow::Result<String> {
+pub fn cargo_mutants_version(exec: &dyn Exec, root: &Path) -> Result<String> {
     let output = exec.run("cargo", &version_args(), root)?;
     if !output.success() {
-        anyhow::bail!("cargo mutants --version failed: {}", output.stderr.trim());
+        return Err(Error::Version {
+            stderr: output.stderr.trim().to_owned(),
+        });
     }
     Ok(output.stdout.trim().to_owned())
 }
@@ -275,7 +283,7 @@ pub fn save_all(
     root: &Path,
     packages: &BTreeMap<String, PackageVerdicts>,
     cargo_mutants: &str,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     for (package, (fingerprint, entries)) in packages {
         let mut store = Store::empty(package, cargo_mutants);
         for (name, entry) in entries {
@@ -352,13 +360,15 @@ struct MetadataPackage {
 /// # Errors
 ///
 /// Returns when `cargo metadata` fails or its output is not package records.
-pub fn package_dirs(root: &Path, exec: &dyn Exec) -> anyhow::Result<BTreeMap<String, PathBuf>> {
+pub fn package_dirs(root: &Path, exec: &dyn Exec) -> Result<BTreeMap<String, PathBuf>> {
     let output = exec.run("cargo", &metadata_args(), root)?;
     if !output.success() {
-        anyhow::bail!("cargo metadata failed: {}", output.stderr.trim());
+        return Err(Error::Metadata {
+            stderr: output.stderr.trim().to_owned(),
+        });
     }
-    let metadata: Metadata = serde_json::from_str(&output.stdout)
-        .map_err(|err| anyhow::anyhow!("parse cargo metadata: {err}"))?;
+    let metadata: Metadata =
+        serde_json::from_str(&output.stdout).map_err(|source| Error::MetadataJson { source })?;
     Ok(metadata
         .packages
         .into_iter()
@@ -375,15 +385,13 @@ pub fn package_dirs(root: &Path, exec: &dyn Exec) -> anyhow::Result<BTreeMap<Str
 /// # Errors
 ///
 /// Returns when a file cannot be read.
-pub fn fingerprint(
-    package: &str,
-    files: &[PathBuf],
-    cargo_mutants: &str,
-) -> anyhow::Result<Fingerprint> {
+pub fn fingerprint(package: &str, files: &[PathBuf], cargo_mutants: &str) -> Result<Fingerprint> {
     let mut hashes = Vec::with_capacity(files.len());
     for (index, path) in files.iter().enumerate() {
-        let content =
-            std::fs::read(path).map_err(|err| anyhow::anyhow!("read {}: {err}", path.display()))?;
+        let content = std::fs::read(path).map_err(|source| Error::Read {
+            path: path.clone(),
+            source,
+        })?;
         hashes.push(FileHash {
             path_index: index,
             hash: Sha256::digest(&content).into(),
@@ -464,7 +472,7 @@ mod tests {
                 _program: &str,
                 _args: &[String],
                 _cwd: &Path,
-            ) -> anyhow::Result<crate::exec::Output> {
+            ) -> Result<crate::exec::Output> {
                 Ok(crate::exec::Output {
                     code: 0,
                     stdout: self.0.to_owned(),
@@ -486,7 +494,7 @@ mod tests {
                 _program: &str,
                 _args: &[String],
                 _cwd: &Path,
-            ) -> anyhow::Result<crate::exec::Output> {
+            ) -> Result<crate::exec::Output> {
                 Ok(crate::exec::Output {
                     code: 1,
                     stdout: String::new(),

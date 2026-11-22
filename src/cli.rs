@@ -10,6 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::accept::{self, Accepted};
 use crate::cache::{self, Entry, Hits};
 use crate::diff::Diff;
+use crate::error::{Error, Result};
 use crate::exec::{self, Exec, Real};
 use crate::mutant::{self, Mutant, MutantId};
 use crate::report::{self, Gate, GateResult, Outcome, Record, Summary};
@@ -88,10 +89,11 @@ pub struct Project {
 }
 
 impl Project {
-    fn root(&self) -> anyhow::Result<PathBuf> {
-        self.root
-            .canonicalize()
-            .map_err(|err| anyhow::anyhow!("root {}: {err}", self.root.display()))
+    fn root(&self) -> Result<PathBuf> {
+        self.root.canonicalize().map_err(|source| Error::Root {
+            path: self.root.clone(),
+            source,
+        })
     }
 }
 
@@ -158,7 +160,7 @@ pub struct AcceptArgs {
 }
 
 /// Parse `NN`, `NN.N`, or `NN.NN`, optionally with a trailing `%`, as basis points.
-fn parse_percent(text: &str) -> Result<u32, String> {
+fn parse_percent(text: &str) -> std::result::Result<u32, String> {
     let body = text.strip_suffix('%').unwrap_or(text).trim();
     if body.is_empty() || body.ends_with('.') {
         return Err(format!("{text:?} is not a percentage"));
@@ -178,7 +180,7 @@ fn parse_percent(text: &str) -> Result<u32, String> {
 }
 
 /// Read a percentage fraction, which holds at most two digits, as hundredths.
-fn parse_fraction(text: &str, fraction: &str) -> Result<u32, String> {
+fn parse_fraction(text: &str, fraction: &str) -> std::result::Result<u32, String> {
     if fraction.len() > 2 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(format!("{text:?} needs at most two decimal digits"));
     }
@@ -240,7 +242,7 @@ pub fn execute(
     exec: &dyn Exec,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> anyhow::Result<i32> {
+) -> Result<i32> {
     let mut session = Session {
         exec,
         err,
@@ -304,7 +306,7 @@ pub fn execute(
     Ok(0)
 }
 
-fn emit(summary: &Summary, reporters: &[Reporter], out: &mut dyn Write) -> anyhow::Result<()> {
+fn emit(summary: &Summary, reporters: &[Reporter], out: &mut dyn Write) -> Result<()> {
     let mut seen = Vec::new();
     for reporter in reporters {
         if seen.contains(reporter) {
@@ -381,7 +383,7 @@ impl Session<'_> {
         root: &Path,
         selected: &[(&'a Mutant, MutantId)],
         accepted: &Accepted,
-    ) -> anyhow::Result<Decision<'a>> {
+    ) -> Result<Decision<'a>> {
         let cargo_mutants = cache::cargo_mutants_version(self.exec, root)?;
         let dirs = cache::package_dirs(root, self.exec)?;
         let mut hits = Hits::default();
@@ -421,12 +423,7 @@ impl Session<'_> {
     ///
     /// Mutants decided by this run replace their stored verdict. Mutants it left
     /// out keep theirs, so a killed mutant does not become pending again.
-    fn store(
-        &mut self,
-        root: &Path,
-        decision: &Decision<'_>,
-        records: &[Record],
-    ) -> anyhow::Result<()> {
+    fn store(&mut self, root: &Path, decision: &Decision<'_>, records: &[Record]) -> Result<()> {
         let by_name: BTreeMap<&str, Outcome> = records
             .iter()
             .map(|record| (record.name.as_str(), record.outcome))
@@ -472,26 +469,28 @@ impl Session<'_> {
         }
     }
 
-    fn git(&mut self, root: &Path, args: &[&str]) -> anyhow::Result<String> {
+    fn git(&mut self, root: &Path, args: &[&str]) -> Result<String> {
         let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
         self.announce("git", &owned);
         let output = self.exec.run("git", &owned, root)?;
         if !output.success() {
-            anyhow::bail!("git {} failed: {}", args.join(" "), output.stderr.trim());
+            return Err(Error::Git {
+                command: args.join(" "),
+                stderr: output.stderr.trim().to_owned(),
+            });
         }
         Ok(output.stdout)
     }
 
-    fn list(&mut self, root: &Path) -> anyhow::Result<Vec<Mutant>> {
+    fn list(&mut self, root: &Path) -> Result<Vec<Mutant>> {
         let args = exec::list_args(self.project.manifest_path.as_deref());
         self.announce("cargo", &args);
         let output = self.exec.run("cargo", &args, root)?;
         if !output.success() {
-            anyhow::bail!(
-                "cargo mutants --list failed with exit {}: {}",
-                output.code,
-                output.stderr.trim()
-            );
+            return Err(Error::List {
+                code: output.code,
+                stderr: output.stderr.trim().to_owned(),
+            });
         }
         mutant::parse_list(&output.stdout)
     }
@@ -502,22 +501,30 @@ impl Session<'_> {
         selection: &Selection,
         root: &Path,
         mutants: &[Mutant],
-    ) -> anyhow::Result<(String, Vec<usize>)> {
+    ) -> Result<(String, Vec<usize>)> {
         let (scope, diff) = if let Some(path) = &selection.diff {
-            let text = std::fs::read_to_string(path)
-                .map_err(|err| anyhow::anyhow!("read {}: {err}", path.display()))?;
-            let diff =
-                Diff::parse(&text).map_err(|err| anyhow::anyhow!("{}: {err}", path.display()))?;
+            let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
+                path: path.clone(),
+                source,
+            })?;
+            let diff = Diff::parse(&text).map_err(|source| Error::DiffFile {
+                path: path.clone(),
+                source,
+            })?;
             (format!("diff {}", path.display()), diff)
         } else if let Some(revision) = &selection.since {
             let base = self.git(root, &["merge-base", revision, "HEAD"])?;
             let base = base.trim();
             if base.is_empty() {
-                anyhow::bail!("git merge-base {revision} HEAD printed no commit");
+                return Err(Error::EmptyMergeBase {
+                    revision: revision.clone(),
+                });
             }
             let text = self.git(root, &["diff", "-U0", "--no-color", "--no-ext-diff", base])?;
-            let diff =
-                Diff::parse(&text).map_err(|err| anyhow::anyhow!("git diff {base}: {err}"))?;
+            let diff = Diff::parse(&text).map_err(|source| Error::Diff {
+                commit: base.to_owned(),
+                source,
+            })?;
             (format!("diff since {revision}"), diff)
         } else {
             return Ok(("all mutants".to_owned(), (0..mutants.len()).collect()));
@@ -531,7 +538,7 @@ impl Session<'_> {
         Ok((scope, selected))
     }
 
-    fn run_mutants(&mut self, root: &Path, pending: &[&Mutant]) -> anyhow::Result<Ran> {
+    fn run_mutants(&mut self, root: &Path, pending: &[&Mutant]) -> Result<Ran> {
         let mut records = Vec::new();
         for (index, chunk) in pending.chunks(CHUNK).enumerate() {
             let names: Vec<&str> = chunk.iter().map(|mutant| mutant.name.as_str()).collect();
@@ -540,8 +547,10 @@ impl Session<'_> {
                 .join("mutator")
                 .join(format!("mutants-{index}"));
             // `cargo mutants` creates its output directory but not the parent of `--output`.
-            std::fs::create_dir_all(&out_dir)
-                .map_err(|err| anyhow::anyhow!("create {}: {err}", out_dir.display()))?;
+            std::fs::create_dir_all(&out_dir).map_err(|source| Error::Create {
+                path: out_dir.clone(),
+                source,
+            })?;
             let args = exec::run_args(
                 &names,
                 &out_dir,
@@ -562,14 +571,15 @@ impl Session<'_> {
                 )));
             }
             if !matches!(output.code, 0 | GATE_FAILED | 3) {
-                anyhow::bail!(
-                    "cargo mutants failed with exit {}: {}",
-                    output.code,
-                    output.stderr.trim()
-                );
+                return Err(Error::Run {
+                    code: output.code,
+                    stderr: output.stderr.trim().to_owned(),
+                });
             }
-            let text = std::fs::read_to_string(&outcomes_path)
-                .map_err(|err| anyhow::anyhow!("read {}: {err}", outcomes_path.display()))?;
+            let text = std::fs::read_to_string(&outcomes_path).map_err(|source| Error::Read {
+                path: outcomes_path.clone(),
+                source,
+            })?;
             if report::baseline_failed(&text)? {
                 return Ok(Ran::BaselineFailed(format!(
                     "tests fail without any mutant; see {}",
@@ -592,9 +602,9 @@ pub fn execute_accept(
     args: &AcceptArgs,
     exec: &dyn Exec,
     out: &mut dyn Write,
-) -> anyhow::Result<i32> {
+) -> Result<i32> {
     if args.reason.trim().is_empty() {
-        anyhow::bail!("--reason must say why no input can observe the mutant");
+        return Err(Error::EmptyReason);
     }
     let root = project.root()?;
     let mut discard = std::io::sink();
@@ -612,9 +622,9 @@ pub fn execute_accept(
     let mut accepted = Accepted::load(&root)?;
     for requested in &args.ids {
         let Some(id) = known.get(requested) else {
-            anyhow::bail!(
-                "no mutant with id {requested}; run `mutator --list --all` for the ids in the project"
-            );
+            return Err(Error::UnknownMutant {
+                id: requested.clone(),
+            });
         };
         accepted.insert(id.clone(), args.reason.clone());
         writeln!(out, "accepted {}", id.as_str())?;
@@ -717,14 +727,18 @@ mod tests {
     }
 
     impl Exec for Fake {
-        fn run(&self, program: &str, args: &[String], cwd: &Path) -> anyhow::Result<Output> {
+        fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<Output> {
             self.calls.borrow_mut().push(args.to_vec());
             if program == "git" {
-                return self
-                    .git
-                    .borrow_mut()
-                    .pop_front()
-                    .ok_or_else(|| anyhow::anyhow!("no git answer for {}", args.join(" ")));
+                return self.git.borrow_mut().pop_front().ok_or_else(|| {
+                    crate::error::Error::Spawn {
+                        program: format!("git {}", args.join(" ")),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "no queued answer",
+                        ),
+                    }
+                });
             }
             if args.iter().any(|arg| arg == "--list") {
                 return Ok(ok(&self.list));
@@ -749,7 +763,10 @@ mod tests {
                 self.runs
                     .borrow_mut()
                     .pop_front()
-                    .ok_or_else(|| anyhow::anyhow!("no run answer for {}", args.join(" ")))?
+                    .ok_or_else(|| crate::error::Error::Run {
+                        code: -1,
+                        stderr: format!("no queued answer for {}", args.join(" ")),
+                    })?
             };
             let index = *self.run_index.borrow();
             *self.run_index.borrow_mut() = index + 1;
@@ -1083,7 +1100,7 @@ mod tests {
     }
 
     impl Exec for CacheFake {
-        fn run(&self, program: &str, args: &[String], _cwd: &Path) -> anyhow::Result<Output> {
+        fn run(&self, program: &str, args: &[String], _cwd: &Path) -> Result<Output> {
             if program == "cargo" && args.first().is_some_and(|a| a == "metadata") {
                 let name = self
                     .root
@@ -1102,11 +1119,14 @@ mod tests {
             }
             if args.iter().any(|arg| arg == "--output") {
                 self.runs_started.borrow_mut().push(args.to_vec());
-                let (code, json) = self
-                    .runs
-                    .borrow_mut()
-                    .pop_front()
-                    .ok_or_else(|| anyhow::anyhow!("unexpected run"))?;
+                let (code, json) =
+                    self.runs
+                        .borrow_mut()
+                        .pop_front()
+                        .ok_or_else(|| crate::error::Error::Run {
+                            code: -1,
+                            stderr: "unexpected run".to_owned(),
+                        })?;
                 let dir = args
                     .iter()
                     .position(|arg| arg == "--output")
@@ -1293,7 +1313,7 @@ mod dispatch_tests {
     }
 
     impl Exec for Scripted {
-        fn run(&self, program: &str, args: &[String], _cwd: &Path) -> anyhow::Result<Output> {
+        fn run(&self, program: &str, args: &[String], _cwd: &Path) -> Result<Output> {
             if program == "git" {
                 return Ok(self.git.borrow_mut().remove(0));
             }
