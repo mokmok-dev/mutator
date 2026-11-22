@@ -57,6 +57,22 @@
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="clang"
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="clang"
           '';
+
+          # The binary a consumer gets from `inputs.mutator.packages.<system>.default`.
+          mutator = craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              cargoBuildCommand = "cargo build --release --package mutator";
+              cargoExtraArgs = "--package mutator";
+              doCheck = false;
+              meta = {
+                description = "Diff-driven mutation testing for Rust on top of cargo-mutants";
+                license = pkgs.lib.licenses.mit;
+                mainProgram = "mutator";
+              };
+            }
+          );
         in
         {
           _module.args.pkgs = import nixpkgs {
@@ -64,7 +80,18 @@
             overlays = [ rust-overlay.overlays.default ];
           };
 
-          apps = { };
+          apps = {
+            default = {
+              type = "app";
+              program = "${mutator}/bin/mutator";
+              meta.description = "Diff-driven mutation testing for Rust";
+            };
+            mutator = {
+              type = "app";
+              program = "${mutator}/bin/mutator";
+              meta.description = "Diff-driven mutation testing for Rust";
+            };
+          };
 
           checks = {
             clippy = craneLib.cargoClippy (
@@ -106,7 +133,10 @@
             '';
           };
 
-          packages = { };
+          packages = {
+            default = mutator;
+            inherit mutator;
+          };
 
           pre-commit.settings = {
             hooks = {

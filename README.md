@@ -21,12 +21,22 @@ Inspired by [mizchi/mutator](https://github.com/mizchi/mutator), which does the 
 
 ## Install
 
-The repository builds with Nix. From a checkout:
+The flake exposes the binary, so another flake can take it as an input:
+
+```nix
+{
+  inputs.mutator.url = "github:mokmok-dev/mutator";
+  inputs.mutator.inputs.nixpkgs.follows = "nixpkgs";
+}
+```
+
+Then use `inputs.mutator.packages.${system}.default`, or run it directly:
 
 ```sh
-nix develop --command cargo build --release
-# target/release/mutator
+nix run github:mokmok-dev/mutator -- --since main
 ```
+
+From a checkout, `nix build` and `nix run . -- --version` do the same. `nix develop` gives you the toolchain, `cargo-mutants`, and `cargo-nextest`.
 
 ## Use
 
