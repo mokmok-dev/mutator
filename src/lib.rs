@@ -12,6 +12,7 @@
 )]
 
 pub mod accept;
+pub mod cache;
 pub mod cli;
 pub mod diff;
 pub mod exec;

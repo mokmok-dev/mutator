@@ -8,10 +8,11 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::accept::{self, Accepted};
+use crate::cache::{self, Entry, Hits};
 use crate::diff::Diff;
 use crate::exec::{self, Exec, Real};
 use crate::mutant::{self, Mutant, MutantId};
-use crate::report::{self, Gate, GateResult, Record, Summary};
+use crate::report::{self, Gate, GateResult, Outcome, Record, Summary};
 
 /// Mutants per `cargo mutants` invocation. Each one repeats the baseline, so keep it large.
 const CHUNK: usize = 400;
@@ -56,6 +57,10 @@ pub struct Run {
     /// Print the selected mutant names and run nothing.
     #[arg(long)]
     pub list: bool,
+
+    /// Reuse verdicts for mutants whose package is byte-for-byte unchanged.
+    #[arg(long)]
+    pub cache: bool,
 }
 
 /// Where the project lives and how `cargo-mutants` reaches it.
@@ -240,6 +245,7 @@ pub fn execute(
         exec,
         err,
         project: &run.project,
+        cached_packages: Vec::new(),
     };
     let root = run.project.root()?;
     let mutants = session.list(&root)?;
@@ -265,21 +271,30 @@ pub fn execute(
         .iter()
         .map(|index| (&mutants[*index], ids[*index].clone()))
         .collect();
-    let pending: Vec<&Mutant> = selected
-        .iter()
-        .filter(|(_, id)| !accepted.is_accepted(id))
-        .map(|(mutant, _)| *mutant)
-        .collect();
 
-    let records = match session.run_mutants(&root, &pending)? {
+    // Accepted entries never run. With `--cache`, a mutant whose package is
+    // byte-for-byte unchanged is decided from its stored verdict instead.
+    let decision = if run.cache {
+        session.decide(&root, &selected, &accepted)?
+    } else {
+        Decision::none(&selected, &accepted)
+    };
+
+    let records = match session.run_mutants(&root, &decision.pending)? {
         Ran::Records(records) => records,
         Ran::BaselineFailed(message) => {
             writeln!(out, "mutator: {message}")?;
             return Ok(BASELINE_FAILED);
         }
     };
+    if run.cache {
+        session.store(&root, &decision, &records)?;
+    }
+    let mut records = records;
+    records.extend(decision.settled());
 
-    let summary = report::build(&selected, &records, &accepted, scope, mutants.len(), stale);
+    let summary = report::build(&selected, &records, &accepted, scope, mutants.len(), stale)
+        .with_reuse(decision.reused_caught, decision.reused_missed);
     emit(&summary, &run.reporter, out)?;
 
     if let GateResult::Fail(message) = summary.gate(&run.gate.gate()) {
@@ -305,14 +320,151 @@ fn emit(summary: &Summary, reporters: &[Reporter], out: &mut dyn Write) -> anyho
     Ok(())
 }
 
+/// What a run learned about a package, so the next run can reuse it.
+struct Learned {
+    package: String,
+    fingerprint: cache::Fingerprint,
+}
+
+/// Who runs and who is settled from a stored verdict.
+struct Decision<'a> {
+    /// Mutants that still need `cargo-mutants`.
+    pending: Vec<&'a Mutant>,
+    /// Mutants a stored verdict already killed.
+    reused_caught: usize,
+    /// Mutants a stored verdict already showed surviving.
+    reused_missed: usize,
+    /// Caught records to inject for the reused kills.
+    settled: Vec<Record>,
+}
+
+impl<'a> Decision<'a> {
+    /// No cache: everything not accepted runs.
+    fn none(selected: &[(&'a Mutant, MutantId)], accepted: &Accepted) -> Self {
+        Self {
+            pending: selected
+                .iter()
+                .filter(|(_, id)| !accepted.is_accepted(id))
+                .map(|(mutant, _)| *mutant)
+                .collect(),
+            reused_caught: 0,
+            reused_missed: 0,
+            settled: Vec::new(),
+        }
+    }
+
+    /// Records for verdicts a stored entry already decided, so the report and the
+    /// gate treat a reused kill exactly like a fresh one.
+    fn settled(&self) -> Vec<Record> {
+        self.settled.clone()
+    }
+}
+
 /// One run's dependencies, so each command sees the same seam and echo stream.
 struct Session<'a> {
     exec: &'a dyn Exec,
     err: &'a mut dyn Write,
     project: &'a Project,
+    /// Packages whose fingerprints this run computed, for storing verdicts.
+    cached_packages: Vec<Learned>,
 }
 
 impl Session<'_> {
+    /// Split the selection into reused verdicts and work that still needs a run.
+    ///
+    /// A mutant is reused only when its package's fingerprint matches a stored
+    /// entry. Killed mutants are settled from the store. Survivors are decided
+    /// again so a new test can kill them, since a survivor only means that no
+    /// test observed it.
+    fn decide<'a>(
+        &mut self,
+        root: &Path,
+        selected: &[(&'a Mutant, MutantId)],
+        accepted: &Accepted,
+    ) -> anyhow::Result<Decision<'a>> {
+        let cargo_mutants = cache::cargo_mutants_version(self.exec, root)?;
+        let dirs = cache::package_dirs(root, self.exec)?;
+        let mut hits = Hits::default();
+        let mut packages = Vec::new();
+        for (package, dir) in &dirs {
+            let files = cache::fingerprint_sources(root, dir);
+            let fingerprint = cache::fingerprint(package, &files, &cargo_mutants)?;
+            hits.extend(&cache::load(root, package, &fingerprint, &cargo_mutants));
+            packages.push(Learned {
+                package: package.clone(),
+                fingerprint,
+            });
+        }
+        self.cached_packages = packages;
+        let mut decision = Decision::none(selected, accepted);
+        decision.settled = selected
+            .iter()
+            .filter(|(mutant, id)| !accepted.is_accepted(id) && hits.killed(&mutant.name))
+            .map(|(mutant, _)| Record {
+                name: mutant.name.clone(),
+                outcome: Outcome::Caught,
+            })
+            .collect();
+        decision
+            .pending
+            .retain(|pending| !hits.killed(&pending.name));
+        decision.reused_caught = decision.settled.len();
+        decision.reused_missed = decision
+            .pending
+            .iter()
+            .filter(|pending| hits.seen(&pending.name))
+            .count();
+        Ok(decision)
+    }
+
+    /// Write what this run learned, so the next unchanged package hits.
+    ///
+    /// Mutants decided by this run replace their stored verdict. Mutants it left
+    /// out keep theirs, so a killed mutant does not become pending again.
+    fn store(
+        &mut self,
+        root: &Path,
+        decision: &Decision<'_>,
+        records: &[Record],
+    ) -> anyhow::Result<()> {
+        let by_name: BTreeMap<&str, Outcome> = records
+            .iter()
+            .map(|record| (record.name.as_str(), record.outcome))
+            .collect();
+        let cargo_mutants = cache::cargo_mutants_version(self.exec, root)?;
+        let mut learned = BTreeMap::new();
+        for package in &self.cached_packages {
+            let existing =
+                cache::load(root, &package.package, &package.fingerprint, &cargo_mutants);
+            let mut entries: BTreeMap<String, Entry> = existing.entries().clone();
+            for mutant in decision
+                .pending
+                .iter()
+                .filter(|m| m.package == package.package)
+            {
+                let caught = match by_name.get(mutant.name.as_str()) {
+                    Some(Outcome::Caught) => Some(true),
+                    Some(Outcome::Missed) => Some(false),
+                    _ => None,
+                };
+                if let Some(caught) = caught {
+                    entries.insert(
+                        mutant.name.clone(),
+                        Entry {
+                            package: package.package.clone(),
+                            caught,
+                        },
+                    );
+                }
+            }
+            learned.insert(
+                package.package.clone(),
+                (package.fingerprint, entries.into_iter().collect()),
+            );
+        }
+        cache::save_all(root, &learned, &cargo_mutants)
+    }
+
     /// Echo a command to stderr when `--verbose` is set, keeping stdout parseable.
     fn announce(&mut self, program: &str, args: &[String]) {
         if self.project.verbose {
@@ -450,6 +602,7 @@ pub fn execute_accept(
         exec,
         err: &mut discard,
         project,
+        cached_packages: Vec::new(),
     };
     let mutants = session.list(&root)?;
     let known: BTreeMap<String, MutantId> = mutant::assign_ids(&mutants)
@@ -640,7 +793,7 @@ mod tests {
         Cli::parse_from(argv).run
     }
 
-    fn execute_str(run: &Run, fake: &Fake) -> (i32, String) {
+    fn execute_str(run: &Run, fake: &dyn Exec) -> (i32, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = execute(run, fake, &mut out, &mut err).unwrap_or_else(|err| panic!("{err:#}"));
@@ -893,6 +1046,209 @@ mod tests {
         assert!(Cli::try_parse_from(["mutator", "--since", "main", "--all"]).is_err());
         assert!(Cli::try_parse_from(["mutator", "--since", "main", "--diff", "x"]).is_err());
         assert!(Cli::try_parse_from(["mutator", "--diff", "x", "--all"]).is_err());
+    }
+
+    /// A project on disk with one package, so fingerprints and `cargo metadata` are real.
+    fn cache_project(name: &str) -> PathBuf {
+        let root = temp_root(&format!("cache-{name}"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        )
+        .unwrap();
+        root
+    }
+
+    /// Serves `cargo metadata`, `cargo mutants --version`, and runs from the queue.
+    struct CacheFake {
+        root: PathBuf,
+        runs: RefCell<std::collections::VecDeque<(i32, String)>>,
+        runs_started: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl CacheFake {
+        fn new(root: &Path, runs: Vec<(i32, &str)>) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                runs: RefCell::new(
+                    runs.into_iter()
+                        .map(|(code, json)| (code, json.to_owned()))
+                        .collect(),
+                ),
+                runs_started: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Exec for CacheFake {
+        fn run(&self, program: &str, args: &[String], _cwd: &Path) -> anyhow::Result<Output> {
+            if program == "cargo" && args.first().is_some_and(|a| a == "metadata") {
+                let name = self
+                    .root
+                    .join("Cargo.toml")
+                    .to_str()
+                    .map_or_else(String::new, str::to_owned);
+                return Ok(ok(&format!(
+                    r#"{{"packages":[{{"name":"cachepkg","manifest_path":"{name}"}}]}}"#
+                )));
+            }
+            if args.iter().any(|arg| arg == "--version") {
+                return Ok(ok("cargo-mutants 27.1.0\n"));
+            }
+            if args.iter().any(|arg| arg == "--list") {
+                return Ok(ok(CACHE_LIST));
+            }
+            if args.iter().any(|arg| arg == "--output") {
+                self.runs_started.borrow_mut().push(args.to_vec());
+                let (code, json) = self
+                    .runs
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or_else(|| anyhow::anyhow!("unexpected run"))?;
+                let dir = args
+                    .iter()
+                    .position(|arg| arg == "--output")
+                    .and_then(|index| args.get(index + 1))
+                    .map_or_else(PathBuf::new, PathBuf::from)
+                    .join("mutants.out");
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(dir.join("outcomes.json"), json)?;
+                return Ok(Output {
+                    code,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(Output {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    const CACHE_LIST: &str = r#"[
+      {"name":"m1","file":"src/lib.rs","package":"cachepkg","genre":"FnValue","replacement":"0",
+       "span":{"start":{"line":1,"column":1},"end":{"line":1,"column":2}},
+       "function":{"function_name":"f","return_type":"-> ()",
+                   "span":{"start":{"line":1,"column":1},"end":{"line":3,"column":2}}}}
+    ]"#;
+
+    fn killed(name: &str) -> String {
+        format!(
+            r#"{{"outcomes":[{{"scenario":"Baseline","summary":"Success"}},{{"scenario":{{"Mutant":{{"name":"{name}"}}}},"summary":"CaughtMutant"}}]}}"#
+        )
+    }
+
+    fn survived(name: &str) -> String {
+        format!(
+            r#"{{"outcomes":[{{"scenario":"Baseline","summary":"Success"}},{{"scenario":{{"Mutant":{{"name":"{name}"}}}},"summary":"MissedMutant"}}]}}"#
+        )
+    }
+
+    fn cached_run(root: &Path, extra: &[&str]) -> Run {
+        let mut argv = vec![
+            "mutator".to_owned(),
+            "--root".to_owned(),
+            root.display().to_string(),
+            "--cache".to_owned(),
+        ];
+        argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
+        Cli::parse_from(argv).run
+    }
+
+    #[test]
+    fn a_second_unchanged_run_reuses_the_kill_without_rebuilding() {
+        let root = cache_project("reuse");
+        let first = execute_str(
+            &cached_run(&root, &[]),
+            &CacheFake::new(&root, vec![(0, killed("m1").as_str())]),
+        );
+        assert_eq!(first.0, 0, "{}", first.1);
+        assert!(first.1.contains("KILLED"), "{}", first.1);
+
+        let second = CacheFake::new(&root, vec![]);
+        let (code, text) = execute_str(&cached_run(&root, &["--fail-on-survived"]), &second);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains("KILLED"),
+            "the reused verdict must still count: {text}"
+        );
+        assert!(text.contains("1 killed verdict reused"), "{text}");
+        assert!(
+            second.runs_started.borrow().is_empty(),
+            "nothing should run"
+        );
+    }
+
+    #[test]
+    fn a_source_change_invalidates_the_entry() {
+        let root = cache_project("invalidated");
+        execute_str(
+            &cached_run(&root, &[]),
+            &CacheFake::new(&root, vec![(0, killed("m1").as_str())]),
+        );
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() { let _ = 1; }\n").unwrap();
+
+        let second = CacheFake::new(&root, vec![(0, killed("m1").as_str())]);
+        let (code, text) = execute_str(&cached_run(&root, &[]), &second);
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(
+            second.runs_started.borrow().len(),
+            1,
+            "the change must force a run"
+        );
+        assert!(!text.contains("reused"), "{text}");
+    }
+
+    #[test]
+    fn a_stored_survivor_runs_again_so_a_new_test_can_kill_it() {
+        let root = cache_project("survivor");
+        let first = execute_str(
+            &cached_run(&root, &["--fail-on-survived"]),
+            &CacheFake::new(&root, vec![(2, survived("m1").as_str())]),
+        );
+        assert_eq!(first.0, 2, "{}", first.1);
+
+        let second = CacheFake::new(&root, vec![(0, killed("m1").as_str())]);
+        let (code, text) = execute_str(&cached_run(&root, &["--fail-on-survived"]), &second);
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(second.runs_started.borrow().len(), 1);
+        assert!(text.contains("1 survivors decided again"), "{text}");
+    }
+
+    #[test]
+    fn without_the_flag_nothing_is_read_or_written() {
+        let root = cache_project("disabled");
+        let fake = CacheFake::new(&root, vec![(0, killed("m1").as_str())]);
+        let (code, text) = execute_str(&run_at(&root, &[]), &fake);
+        assert_eq!(code, 0, "{text}");
+        assert!(!root.join(crate::cache::DIR).exists(), "no cache directory");
+        assert!(!text.contains("cache:"), "{text}");
+    }
+
+    #[test]
+    fn an_accepted_mutant_is_reused_too() {
+        let root = cache_project("accepted");
+        execute_str(
+            &cached_run(&root, &[]),
+            &CacheFake::new(&root, vec![(0, killed("m1").as_str())]),
+        );
+
+        let mut accepted = Accepted::default();
+        accepted.insert(
+            MutantId::new("src/lib.rs", "f", "FnValue", "0", 0),
+            "why".to_owned(),
+        );
+        accepted.save(&root).unwrap();
+
+        let second = CacheFake::new(&root, vec![]);
+        let (code, text) = execute_str(&cached_run(&root, &["--fail-on-survived"]), &second);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("ACCEPTED"), "{text}");
+        assert!(second.runs_started.borrow().is_empty());
     }
 
     #[test]

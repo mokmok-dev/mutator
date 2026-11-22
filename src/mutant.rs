@@ -12,6 +12,7 @@ use crate::diff::{Diff, Span};
 pub struct Mutant {
     pub name: String,
     pub file: String,
+    pub package: String,
     pub genre: String,
     pub replacement: String,
     pub span: Span,
@@ -155,6 +156,7 @@ mod tests {
         Mutant {
             name: name.to_owned(),
             file: "src/lib.rs".to_owned(),
+            package: "mutator".to_owned(),
             genre: genre.to_owned(),
             replacement: replacement.to_owned(),
             span: span((body.0, 5), (body.0, 9)),

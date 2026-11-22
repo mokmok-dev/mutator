@@ -156,9 +156,18 @@ pub struct Summary {
     pub scope: String,
     pub scope_total: usize,
     pub stale: Vec<String>,
+    /// Mutants settled by a stored verdict instead of a run: caught, then missed.
+    pub reused: (usize, usize),
 }
 
 impl Summary {
+    /// Note how many verdicts came from the cache.
+    #[must_use]
+    pub const fn with_reuse(mut self, caught: usize, missed: usize) -> Self {
+        self.reused = (caught, missed);
+        self
+    }
+
     #[must_use]
     pub fn counts(&self) -> Counts {
         let mut counts = Counts::default();
@@ -290,6 +299,7 @@ pub fn build(
         scope,
         scope_total,
         stale,
+        reused: (0, 0),
     }
 }
 
@@ -345,6 +355,14 @@ pub fn render_text(summary: &Summary) -> String {
         counts.unviable,
         counts.not_run
     );
+    if summary.reused != (0, 0) {
+        let (caught, missed) = summary.reused;
+        let _ = writeln!(
+            text,
+            "cache: {caught} killed {} reused, {missed} survivors decided again",
+            plural(caught, "verdict", "verdicts")
+        );
+    }
     if !summary.stale.is_empty() {
         let _ = writeln!(
             text,
@@ -370,6 +388,14 @@ struct JsonReport<'a> {
     rows: &'a [Row],
     #[serde(rename = "staleAccepted")]
     stale_accepted: &'a [String],
+    #[serde(rename = "reused")]
+    reused: Reused,
+}
+
+#[derive(Serialize)]
+struct Reused {
+    caught: usize,
+    missed: usize,
 }
 
 /// The machine report.
@@ -387,6 +413,10 @@ pub fn render_json(summary: &Summary) -> anyhow::Result<String> {
         score_bp: summary.score_bp(),
         rows: &summary.rows,
         stale_accepted: &summary.stale,
+        reused: Reused {
+            caught: summary.reused.0,
+            missed: summary.reused.1,
+        },
     };
     let mut text = serde_json::to_string(&report)
         .map_err(|err| anyhow::anyhow!("render JSON report: {err}"))?;
@@ -430,6 +460,7 @@ mod tests {
         Mutant {
             name: name.to_owned(),
             file: "src/lib.rs".to_owned(),
+            package: "mutator".to_owned(),
             genre: "FnValue".to_owned(),
             replacement: "0".to_owned(),
             span: span(line),
@@ -785,7 +816,7 @@ mod tests {
              \"rows\":[{\"id\":\"src/lib.rs::parse::FnValue::0#0\",\
              \"name\":\"src/lib.rs:3:5: replace parse -> u32 with 0\",\
              \"file\":\"src/lib.rs\",\"line\":3,\"function\":\"parse\",\"status\":\"Caught\"}],\
-             \"staleAccepted\":[]}\n"
+             \"staleAccepted\":[],\"reused\":{\"caught\":0,\"missed\":0}}\n"
         );
     }
 

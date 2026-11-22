@@ -14,6 +14,7 @@ A pull request runs only the mutants its diff can affect. The rest of the projec
 - **Exact selection.** The selected mutants reach `cargo-mutants` as one anchored regex, so a run tests those mutants and no neighbours. Verdicts come back from `mutants.out/outcomes.json` rather than from matching console text.
 - **Stable identity.** A mutant's id is `file::function::genre::replacement#ordinal`. Line numbers are not part of it, so editing above a mutant does not invalidate its accepted-equivalent entry.
 - **Accepted equivalents.** `mutator accept <id> --reason "…"` records a mutant no input can observe in `mutator.accepted.json`, which you commit. The entry leaves the score and the gate, and the report lists entries whose mutant is gone.
+- **`--cache`.** A mutant's verdict is stored against a SHA-256 of every source and test file in its package plus the `cargo-mutants` and `mutator` versions. An unchanged package is decided from the store, so a CI job can hand its cache directory to the next run.
 - **One gate.** `--fail-on-survived` and `--threshold` decide the exit code. Unrun mutants always fail: a run that could not decide a mutant has proved nothing.
 
 Inspired by [mizchi/mutator](https://github.com/mizchi/mutator), which does the same job for TypeScript on top of Vitest, Jest, and Bun.
@@ -45,6 +46,9 @@ mutator --since main --list
 
 # for CI: annotate survivors on the diff
 mutator --since main --fail-on-survived --reporter github
+
+# reuse verdicts for packages that have not changed
+mutator --since main --cache --fail-on-survived
 ```
 
 `--since <rev>` diffs against `git merge-base <rev> HEAD`, so a long-lived branch sees its own changes and not the base's.
@@ -70,9 +74,31 @@ mutator accept 'src/parse.rs::number::BinaryOperator::+#0' \
 
 The id comes from the report. An accepted entry is reported as `ACCEPTED` and stays out of the score.
 
+## The cache
+
+`--cache` stores each verdict under `target/mutator-cache/<package>/<fingerprint>.json`. The fingerprint covers every `.rs` file under the package's `src/`, `tests/`, `benches/` and `examples/`, its `Cargo.toml`, the workspace `Cargo.toml` and `Cargo.lock`, plus the `cargo-mutants` and `mutator` versions.
+
+That is deliberately the whole package: `cargo-mutants` rebuilds and reruns a package's tests for each mutant, so any file in the package can change a verdict. The cost of that choice is that editing one test re-runs every mutant of that package. The benefit is that reuse needs no coverage data and can be wrong in only one direction: it decides nothing the tests would not have decided.
+
+A reused kill is reported as `KILLED` and counted exactly like a fresh one. A stored survivor still runs, since a survivor means "no test observed this mutant" and a new test can change that without touching the package's source. Nothing is read or written without the flag.
+
+```sh
+mutator --cache                 # 272 verdicts reused in 11s, after a 2m50s cold run on this crate
+```
+
+For CI, cache the directory and let it restore across runs:
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: target/mutator-cache
+    key: mutator-cache-${{ github.run_id }}
+    restore-keys: mutator-cache-
+```
+
 ## This repository's own gate
 
-`cargo mutants` on this crate reports **0 missed**: 233 mutants, 213 caught, 20 unviable. The unviable ones do not compile, which is `cargo-mutants`' own verdict and outside the score. CI reruns that check on every push to `main` and every pull request, and the `diff` job runs `mutator --since` on pull request diffs.
+`cargo mutants` on this crate reports **0 missed**: 310 mutants, 272 caught, 38 unviable. The unviable ones do not compile, which is `cargo-mutants`' own verdict and outside the score. CI reruns that check with `--cache` on every push to `main` and every pull request, and the `diff` job runs `mutator --since --cache` on pull request diffs.
 
 The parsers and selectors carry proptest properties alongside their example tests: diff text round-trips through the parser, line intersection agrees with per-line membership, ids survive a uniform line shift, and the accepted store round-trips for adversarial keys.
 
