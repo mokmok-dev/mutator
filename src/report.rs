@@ -1,7 +1,8 @@
-//! Outcome parsing, the status table, scoring, the gate, and the three reporters.
+//! Outcome parsing, the status table, scoring, the gate, and the reporters.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -140,6 +141,8 @@ pub struct Row {
     pub line: u32,
     pub function: String,
     pub status: Status,
+    /// Why an accepted mutant cannot be observed, `null` for every other status.
+    pub reason: Option<String>,
 }
 
 /// Per-status counts.
@@ -153,6 +156,25 @@ pub struct Counts {
     pub not_run: usize,
 }
 
+/// What a run's cache knew about the mutants it selected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CacheStats {
+    /// Selected mutants a stored verdict already killed, so the run reused the verdict.
+    pub caught: usize,
+    /// Selected mutants a stored verdict already showed surviving, so the run decided them again.
+    pub missed: usize,
+    /// Selected mutants with no stored verdict.
+    pub misses: usize,
+}
+
+impl CacheStats {
+    /// Selected mutants a stored verdict decided, killed or not.
+    #[must_use]
+    pub const fn hits(&self) -> usize {
+        self.caught + self.missed
+    }
+}
+
 /// The whole report for one run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
@@ -162,16 +184,44 @@ pub struct Summary {
     pub selection: Reason,
     pub scope_total: usize,
     pub stale: Vec<String>,
-    /// Mutants settled by a stored verdict instead of a run: caught, then missed.
-    pub reused: (usize, usize),
+    /// What the cache knew, absent when `--cache` was not given.
+    pub cache: Option<CacheStats>,
+    /// How long the run took, absent when the caller did not measure it.
+    pub elapsed: Option<Duration>,
 }
 
 impl Summary {
-    /// Note how many verdicts came from the cache.
+    /// Note what the cache knew about the selection.
     #[must_use]
-    pub const fn with_reuse(mut self, caught: usize, missed: usize) -> Self {
-        self.reused = (caught, missed);
+    pub const fn with_cache(mut self, cache: CacheStats) -> Self {
+        self.cache = Some(cache);
         self
+    }
+
+    /// Note how long the run took.
+    #[must_use]
+    pub const fn with_elapsed(mut self, elapsed: Duration) -> Self {
+        self.elapsed = Some(elapsed);
+        self
+    }
+
+    /// Whether every mutant in the project was selected, so the score describes the project.
+    ///
+    /// A narrower selection measures the change, and a report must not present that
+    /// number as coverage of everything.
+    #[must_use]
+    pub const fn repository_wide(&self) -> bool {
+        self.scope_total > 0 && self.rows.len() == self.scope_total
+    }
+
+    /// What the score covers, so a reader cannot mistake a diff's score for the project's.
+    #[must_use]
+    pub const fn scope_kind(&self) -> ScopeKind {
+        if self.repository_wide() {
+            ScopeKind::Repository
+        } else {
+            ScopeKind::Selected
+        }
     }
 
     #[must_use]
@@ -295,6 +345,7 @@ pub fn build(
             line: mutant.line(),
             function: mutant.function_name().to_owned(),
             status: status(id, mutant, &by_name, accepted),
+            reason: accepted.reason(id).map(str::to_owned),
         })
         .collect();
     rows.sort_by(|left, right| {
@@ -306,7 +357,8 @@ pub fn build(
         selection: scope.reason,
         scope_total,
         stale,
-        reused: (0, 0),
+        cache: None,
+        elapsed: None,
     }
 }
 
@@ -326,6 +378,25 @@ fn status(
         Some(Outcome::Timeout) => Status::Timeout,
         Some(Outcome::Unviable) => Status::Unviable,
         None => Status::NotRun,
+    }
+}
+
+/// What a score covers, so a reader cannot mistake a diff's score for the project's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ScopeKind {
+    /// Every mutant in the project was selected.
+    Repository,
+    /// The score describes the mutants this run selected, not the project.
+    Selected,
+}
+
+impl ScopeKind {
+    /// The phrase a summary names the set a score covers with.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Repository => "every mutant in the project",
+            Self::Selected => "the mutants this change selected",
+        }
     }
 }
 
@@ -365,12 +436,14 @@ pub fn render_text(summary: &Summary) -> String {
         counts.unviable,
         counts.not_run
     );
-    if summary.reused != (0, 0) {
-        let (caught, missed) = summary.reused;
+    if let Some(cache) = summary.cache.filter(|cache| cache.hits() > 0) {
         let _ = writeln!(
             text,
-            "cache: {caught} killed {} reused, {missed} survivors decided again",
-            plural(caught, "verdict", "verdicts")
+            "cache: {} killed {} reused, {} survivors decided again, {} misses",
+            cache.caught,
+            plural(cache.caught, "verdict", "verdicts"),
+            cache.missed,
+            cache.misses,
         );
     }
     if !summary.stale.is_empty() {
@@ -401,6 +474,12 @@ struct JsonReport<'a> {
     stale_accepted: &'a [String],
     #[serde(rename = "reused")]
     reused: Reused,
+    /// Every mutant in the project, so a consumer can tell a diff's score from a sweep's.
+    #[serde(rename = "totalMutants")]
+    total_mutants: usize,
+    /// Which set `scoreBp` describes.
+    #[serde(rename = "scoreScope")]
+    score_scope: ScopeKind,
 }
 
 #[derive(Serialize)]
@@ -411,10 +490,14 @@ struct Reused {
 
 /// The machine report.
 ///
+/// New fields are appended and existing ones keep their name, type, and order, so a
+/// consumer written against an older `schemaVersion` keeps reading the same values.
+///
 /// # Errors
 ///
 /// Returns when the report cannot be serialized.
 pub fn render_json(summary: &Summary) -> Result<String> {
+    let cache = summary.cache.unwrap_or_default();
     let report = JsonReport {
         schema_version: 1,
         scope: &summary.scope,
@@ -426,9 +509,11 @@ pub fn render_json(summary: &Summary) -> Result<String> {
         rows: &summary.rows,
         stale_accepted: &summary.stale,
         reused: Reused {
-            caught: summary.reused.0,
-            missed: summary.reused.1,
+            caught: cache.caught,
+            missed: cache.missed,
         },
+        total_mutants: summary.scope_total,
+        score_scope: summary.scope_kind(),
     };
     let mut text = serde_json::to_string(&report).map_err(|source| Error::Serialize {
         what: "JSON report",
@@ -457,6 +542,90 @@ pub fn render_github(summary: &Summary) -> String {
         let _ = writeln!(text, "::notice::stale accepted mutant: {id}");
     }
     text
+}
+
+/// The pull request summary, as GitHub Actions job summary Markdown.
+///
+/// Every number is named with the set it covers, so a diff's score cannot be read as
+/// the project's. The gate line is the reason a failed run failed.
+#[must_use]
+pub fn render_summary(summary: &Summary, gate: &Gate) -> String {
+    let counts = summary.counts();
+    let mut text = String::from("## Mutation testing\n\n");
+    let _ = writeln!(
+        text,
+        "**Gate: {}**\n",
+        match summary.gate(gate) {
+            GateResult::Pass => "passed".to_owned(),
+            GateResult::Fail(reason) => format!("failed, {reason}"),
+        }
+    );
+    let _ = writeln!(
+        text,
+        "| metric | value |\n|---|---|\n\
+         | mutants selected | {} of {} |\n\
+         | killed | {} |\n\
+         | survived | {} |\n\
+         | accepted | {} |\n\
+         | unviable | {} |\n\
+         | timed out | {} |\n\
+         | not run | {} |",
+        summary.rows.len(),
+        summary.scope_total,
+        counts.caught,
+        counts.missed,
+        counts.accepted,
+        counts.unviable,
+        counts.timeout,
+        counts.not_run,
+    );
+    let _ = writeln!(
+        text,
+        "\nMutation score: **{}** ({})",
+        summary.score_text().unwrap_or_else(|| "n/a".to_owned()),
+        summary.scope_kind().label(),
+    );
+    if let Some(cache) = summary.cache {
+        let _ = writeln!(
+            text,
+            "Cache: {} hit, {} miss, {} killed {} reused",
+            cache.hits(),
+            cache.misses,
+            cache.caught,
+            plural(cache.caught, "verdict", "verdicts"),
+        );
+    }
+    if let Some(elapsed) = summary.elapsed {
+        let _ = writeln!(text, "Elapsed: {}", format_seconds(elapsed));
+    }
+    if let Some(reason) = summary.selection.describe() {
+        let _ = writeln!(text, "{reason}");
+    }
+    if counts.missed > 0 {
+        let _ = writeln!(
+            text,
+            "\n{} {}:\n",
+            counts.missed,
+            plural(counts.missed, "survivor", "survivors")
+        );
+        for row in summary
+            .rows
+            .iter()
+            .filter(|row| row.status == Status::Missed)
+        {
+            let _ = writeln!(text, "- `{}` {}", row.file, row.name);
+        }
+    }
+    text
+}
+
+/// A duration as whole seconds, the unit a CI log reads in.
+fn format_seconds(elapsed: Duration) -> String {
+    format!(
+        "{}.{:01}s",
+        elapsed.as_secs(),
+        elapsed.subsec_millis() / 100
+    )
 }
 
 #[cfg(test)]
@@ -830,8 +999,10 @@ mod tests {
              \"detected\":1,\"decided\":1,\"scoreBp\":10000,\
              \"rows\":[{\"id\":\"src/lib.rs::parse::FnValue::0#0\",\
              \"name\":\"src/lib.rs:3:5: replace parse -> u32 with 0\",\
-             \"file\":\"src/lib.rs\",\"line\":3,\"function\":\"parse\",\"status\":\"Caught\"}],\
-             \"staleAccepted\":[],\"reused\":{\"caught\":0,\"missed\":0}}\n"
+             \"file\":\"src/lib.rs\",\"line\":3,\"function\":\"parse\",\"status\":\"Caught\",\
+             \"reason\":null}],\
+             \"staleAccepted\":[],\"reused\":{\"caught\":0,\"missed\":0},\
+             \"totalMutants\":7,\"scoreScope\":\"Selected\"}\n"
         );
     }
 
@@ -850,6 +1021,237 @@ mod tests {
             render_github(&summary),
             "::warning file=src/lib.rs,line=9::mutant survived: src/lib.rs:9:5: replace render -> u32 with 0\n\
              ::notice::stale accepted mutant: gone#0\n"
+        );
+    }
+
+    #[test]
+    fn a_sweep_of_every_mutant_is_a_repository_score() {
+        let (mutants, ids) = one("a", "one", 3);
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Caught)],
+            &Accepted::default(),
+            Scope::all(),
+            1,
+            vec![],
+        );
+        assert!(summary.repository_wide());
+        assert_eq!(summary.scope_kind(), ScopeKind::Repository);
+    }
+
+    #[test]
+    fn a_selection_narrower_than_the_project_is_a_selected_score() {
+        let (mutants, ids) = one("a", "one", 3);
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Caught)],
+            &Accepted::default(),
+            Scope::touched("diff since main"),
+            1,
+            vec![],
+        );
+        assert!(summary.repository_wide());
+        assert_eq!(summary.scope_kind(), ScopeKind::Repository);
+
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Caught)],
+            &Accepted::default(),
+            Scope::touched("diff since main"),
+            2,
+            vec![],
+        );
+        assert!(!summary.repository_wide());
+        assert_eq!(summary.scope_kind(), ScopeKind::Selected);
+    }
+
+    #[test]
+    fn an_empty_project_has_no_repository_score_to_name() {
+        let summary = build(&[], &[], &Accepted::default(), Scope::all(), 0, vec![]);
+        assert!(!summary.repository_wide(), "nothing was measured");
+        assert_eq!(summary.scope_kind(), ScopeKind::Selected);
+    }
+
+    #[test]
+    fn an_accepted_row_carries_its_reason_in_json() {
+        let (mutants, ids) = one("a", "one", 3);
+        let mut accepted = Accepted::default();
+        accepted.insert(ids[0].clone(), "always zero".to_owned());
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[],
+            &accepted,
+            Scope::all(),
+            1,
+            vec![],
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&render_json(&summary).unwrap()).unwrap();
+        assert_eq!(value["rows"][0]["status"], "Accepted");
+        assert_eq!(value["rows"][0]["reason"], "always zero");
+    }
+
+    #[test]
+    fn a_killed_row_has_no_reason_in_json() {
+        let (mutants, ids) = one("a", "one", 3);
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Caught)],
+            &Accepted::default(),
+            Scope::all(),
+            1,
+            vec![],
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&render_json(&summary).unwrap()).unwrap();
+        assert_eq!(value["rows"][0]["reason"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_summary_names_the_gate_and_the_set_the_score_covers() {
+        let (mutants, ids) = one("a", "one", 3);
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Missed)],
+            &Accepted::default(),
+            Scope::touched("diff since main"),
+            9,
+            vec![],
+        );
+        let text = render_summary(&summary, &Gate::default());
+        assert!(
+            text.contains("**Gate: passed**"),
+            "an unflagged survivor is not a failure: {text}"
+        );
+        assert!(text.contains("| mutants selected | 1 of 9 |"), "{text}");
+        assert!(
+            text.contains("(the mutants this change selected)"),
+            "a diff's score must not read as the project's: {text}"
+        );
+        assert!(text.contains("- `src/lib.rs` a"), "{text}");
+    }
+
+    #[test]
+    fn the_summary_gives_the_reason_the_gate_failed() {
+        let (mutants, ids) = one("a", "one", 3);
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Missed)],
+            &Accepted::default(),
+            Scope::all(),
+            1,
+            vec![],
+        );
+        let text = render_summary(
+            &summary,
+            &Gate {
+                fail_on_survived: true,
+                threshold_bp: None,
+            },
+        );
+        assert!(text.contains("**Gate: failed, 1 missed mutant**"), "{text}");
+        assert!(text.contains("(every mutant in the project)"), "{text}");
+    }
+
+    #[test]
+    fn the_summary_reports_cache_hits_misses_and_elapsed() {
+        let (mutants, ids) = one("a", "one", 3);
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Caught)],
+            &Accepted::default(),
+            Scope::all(),
+            1,
+            vec![],
+        )
+        .with_cache(CacheStats {
+            caught: 2,
+            missed: 1,
+            misses: 4,
+        })
+        .with_elapsed(Duration::from_millis(12_340));
+        let text = render_summary(&summary, &Gate::default());
+        assert!(
+            text.contains("Cache: 3 hit, 4 miss, 2 killed verdicts reused"),
+            "{text}"
+        );
+        assert!(text.contains("Elapsed: 12.3s"), "{text}");
+    }
+
+    #[test]
+    fn the_summary_has_no_survivor_section_when_every_mutant_was_killed() {
+        let (mutants, ids) = one("a", "one", 3);
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Caught)],
+            &Accepted::default(),
+            Scope::all(),
+            1,
+            vec![],
+        );
+        let text = render_summary(&summary, &Gate::default());
+        assert!(
+            !text.contains("survivors:"),
+            "nothing survived, so there is no section to print: {text}"
+        );
+    }
+
+    #[test]
+    fn a_summary_without_a_cache_or_a_clock_omits_both_lines() {
+        let (mutants, ids) = one("a", "one", 3);
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Caught)],
+            &Accepted::default(),
+            Scope::all(),
+            1,
+            vec![],
+        );
+        let text = render_summary(&summary, &Gate::default());
+        assert!(!text.contains("Cache:"), "{text}");
+        assert!(!text.contains("Elapsed:"), "{text}");
+    }
+
+    #[test]
+    fn the_text_report_shows_a_cache_line_only_when_a_verdict_was_stored() {
+        let (mutants, ids) = one("a", "one", 3);
+        let summary = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Caught)],
+            &Accepted::default(),
+            Scope::all(),
+            1,
+            vec![],
+        )
+        .with_cache(CacheStats {
+            caught: 1,
+            missed: 0,
+            misses: 3,
+        });
+        assert!(
+            render_text(&summary)
+                .contains("cache: 1 killed verdict reused, 0 survivors decided again, 3 misses"),
+            "{}",
+            render_text(&summary)
+        );
+
+        let cold = build(
+            &selected(&mutants, &ids),
+            &[record("a", Outcome::Caught)],
+            &Accepted::default(),
+            Scope::all(),
+            1,
+            vec![],
+        )
+        .with_cache(CacheStats {
+            caught: 0,
+            missed: 0,
+            misses: 1,
+        });
+        assert!(
+            !render_text(&cold).contains("cache:"),
+            "{}",
+            render_text(&cold)
         );
     }
 }

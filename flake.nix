@@ -130,6 +130,7 @@
               cargo-mutants
               cargo-nextest
               deadnix
+              jq
               linkerPackages
               nixfmt
               nixfmt-tree

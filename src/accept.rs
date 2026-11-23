@@ -66,6 +66,14 @@ impl Accepted {
         self.accepted.contains_key(id.as_str())
     }
 
+    /// Why this id was accepted, absent when it is not.
+    #[must_use]
+    pub fn reason(&self, id: &MutantId) -> Option<&str> {
+        self.accepted
+            .get(id.as_str())
+            .map(|entry| entry.reason.as_str())
+    }
+
     /// Record an id, returning the reason it had before.
     pub fn insert(&mut self, id: MutantId, reason: String) -> Option<String> {
         self.accepted

@@ -116,6 +116,9 @@ mutator --since main --list
 # for CI: annotate survivors on the diff
 mutator --since main --fail-on-survived --reporter github
 
+# for CI: annotate survivors and write the job summary
+mutator --since main --fail-on-survived --reporter github --summary "$GITHUB_STEP_SUMMARY"
+
 # reuse verdicts for packages that have not changed
 mutator --since main --cache --fail-on-survived
 ```
@@ -134,6 +137,7 @@ mutator --since main --cache --fail-on-survived
 | `--threshold <PERCENT>` | exit 2 below this score; `85`, `85.5`, and `85.50%` all parse |
 | `--reporter text\|json\|github` | repeatable |
 | `--cache` | reuse verdicts for unchanged packages |
+| `--summary <FILE>` | write the GitHub Actions job summary as Markdown |
 | `--list` | print the selected names, and the selection reason on stderr when it widened |
 | `--jobs` / `--timeout` / `--manifest-path` | passed to `cargo-mutants` |
 | `--verbose` | echo each command on stderr |
@@ -169,10 +173,15 @@ The text report never claims more than the selection proves. A score from a diff
  "detected":1,"decided":2,"scoreBp":5000,
  "rows":[{"id":"src/lib.rs::parse::FnValue::0#0","name":"…","file":"src/lib.rs",
           "line":3,"function":"parse","status":"Caught"}],
- "staleAccepted":[],"reused":{"caught":0,"missed":0}}
+ "staleAccepted":[],"reused":{"caught":0,"missed":0},
+ "totalMutants":309,"scoreScope":"Selected"}
 ```
 
 `selection.reason` is `All`, `Touched`, `Packages`, or `Workspace`. `status` is one of `Caught`, `Missed`, `Timeout`, `Unviable`, `Accepted`, `NotRun`. `--reporter github` prints `::warning` annotations for survivors and `::notice` for stale accepted entries.
+
+`totalMutants` is every mutant in the project and `scoreScope` says which set `scoreBp` describes: `Repository` when the run selected them all, `Selected` otherwise. A diff's score is never labelled as the project's. New fields are appended and existing ones keep their name, type, and order, so `schemaVersion` stays `1` and a consumer written against it keeps reading the same values.
+
+`--summary <FILE>` writes the job summary GitHub renders on a pull request: the gate result and its reason, the counts, the score with the set it covers, the cache hits and misses, the elapsed time, and each survivor. Write it to `$GITHUB_STEP_SUMMARY` in a workflow step.
 
 ### Exit codes
 
@@ -247,7 +256,7 @@ Do not let a run that saves the cache get cancelled by a newer push. In this rep
 
 ## CI
 
-A pull request job that runs the diff and annotates survivors:
+A pull request job that runs the diff, annotates survivors, and writes the step summary:
 
 ```yaml
 - uses: actions/checkout@v4
@@ -257,10 +266,13 @@ A pull request job that runs the diff and annotates survivors:
 - run: |
     nix develop --command ./target/debug/mutator \
       --since "origin/${{ github.base_ref }}" \
-      --cache --fail-on-survived --reporter github
+      --cache --fail-on-survived \
+      --reporter github --summary "$GITHUB_STEP_SUMMARY"
 ```
 
-`fetch-depth: 0` matters: `--since origin/main` resolves the base commit locally.
+`fetch-depth: 0` matters: `--since origin/main` resolves the base commit locally. The step summary shows the gate result and its reason, the counts, the score with the set it covers, the cache hits and misses, and the elapsed time, so a reviewer reads the outcome without opening the log. A failed run names the survivors on the diff and ends with `gate: failed: <reason>`.
+
+`bench/cache-granularity.sh` records cold, warm, and partial-invalidation timings on a three-crate fixture and fails if a cached run disagrees with an uncached run of the same tree. The timing numbers vary too much between runners to gate on, so CI records them in the step summary and asserts only the agreement.
 
 ## This repository's own gate
 

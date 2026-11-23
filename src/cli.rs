@@ -64,6 +64,10 @@ pub struct Run {
     /// Reuse verdicts for mutants whose package is byte-for-byte unchanged.
     #[arg(long)]
     pub cache: bool,
+
+    /// Write a Markdown job summary to this path, for `$GITHUB_STEP_SUMMARY`.
+    #[arg(long, value_name = "FILE")]
+    pub summary: Option<PathBuf>,
 }
 
 /// Where the project lives and how `cargo-mutants` reaches it.
@@ -245,6 +249,7 @@ pub fn execute(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32> {
+    let started = std::time::Instant::now();
     let mut session = Session {
         exec,
         err,
@@ -305,8 +310,13 @@ pub fn execute(
     records.extend(decision.settled());
 
     let summary = report::build(&selected, &records, &accepted, scope, mutants.len(), stale)
-        .with_reuse(decision.reused_caught, decision.reused_missed);
-    emit(&summary, &run.reporter, out)?;
+        .with_elapsed(started.elapsed());
+    let summary = if run.cache {
+        summary.with_cache(decision.cache)
+    } else {
+        summary
+    };
+    emit(&summary, run, out)?;
 
     if let GateResult::Fail(message) = summary.gate(&run.gate.gate()) {
         writeln!(out, "gate: failed: {message}")?;
@@ -315,9 +325,13 @@ pub fn execute(
     Ok(0)
 }
 
-fn emit(summary: &Summary, reporters: &[Reporter], out: &mut dyn Write) -> Result<()> {
+/// Write every requested report, then the job summary when one was asked for.
+///
+/// The summary goes to a file rather than stdout because GitHub reads it from
+/// `$GITHUB_STEP_SUMMARY`, and a run that also prints JSON must keep stdout parseable.
+fn emit(summary: &Summary, run: &Run, out: &mut dyn Write) -> Result<()> {
     let mut seen = Vec::new();
-    for reporter in reporters {
+    for reporter in &run.reporter {
         if seen.contains(reporter) {
             continue;
         }
@@ -327,6 +341,13 @@ fn emit(summary: &Summary, reporters: &[Reporter], out: &mut dyn Write) -> Resul
             Reporter::Json => write!(out, "{}", report::render_json(summary)?)?,
             Reporter::Github => write!(out, "{}", report::render_github(summary))?,
         }
+    }
+    if let Some(path) = &run.summary {
+        let text = report::render_summary(summary, &run.gate.gate());
+        std::fs::write(path, text).map_err(|source| Error::Write {
+            path: path.clone(),
+            source,
+        })?;
     }
     Ok(())
 }
@@ -347,6 +368,8 @@ struct Decision<'a> {
     reused_missed: usize,
     /// Caught records to inject for the reused kills.
     settled: Vec<Record>,
+    /// What the cache knew about the selection, for the report.
+    cache: report::CacheStats,
 }
 
 impl<'a> Decision<'a> {
@@ -361,6 +384,7 @@ impl<'a> Decision<'a> {
             reused_caught: 0,
             reused_missed: 0,
             settled: Vec::new(),
+            cache: report::CacheStats::default(),
         }
     }
 
@@ -433,6 +457,11 @@ impl Session<'_> {
             .iter()
             .filter(|pending| hits.seen(&pending.name))
             .count();
+        decision.cache = report::CacheStats {
+            caught: decision.reused_caught,
+            missed: decision.reused_missed,
+            misses: decision.pending.len() - decision.reused_missed,
+        };
         Ok(decision)
     }
 
@@ -1111,6 +1140,125 @@ mod tests {
     }
 
     #[test]
+    fn the_summary_file_reports_the_gate_and_keeps_stdout_parseable() {
+        let root = temp_root("summary");
+        let path = root.join("step.md");
+        let fake = Fake::new(LIST, vec![(2, ONE_MISSED)], vec![]);
+        let (code, text) = execute_str(
+            &run_at(
+                &root,
+                &[
+                    "--reporter",
+                    "json",
+                    "--fail-on-survived",
+                    "--summary",
+                    path.to_str().unwrap(),
+                ],
+            ),
+            &fake,
+        );
+        assert_eq!(code, 2);
+        let first_line = text.lines().next().unwrap_or_default();
+        serde_json::from_str::<serde_json::Value>(first_line)
+            .expect("the JSON report is the first line on stdout");
+        let summary = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            summary.contains("**Gate: failed, 1 missed mutant**"),
+            "{summary}"
+        );
+        assert!(summary.contains("| survived | 1 |"), "{summary}");
+    }
+
+    #[test]
+    fn the_summary_file_is_written_even_when_the_gate_passes() {
+        let root = temp_root("summary-pass");
+        let path = root.join("step.md");
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (code, _) = execute_str(
+            &run_at(&root, &["--summary", path.to_str().unwrap()]),
+            &fake,
+        );
+        assert_eq!(code, 0);
+        let summary = std::fs::read_to_string(&path).unwrap();
+        assert!(summary.contains("**Gate: passed**"), "{summary}");
+    }
+
+    #[test]
+    fn an_unwritable_summary_path_is_a_usage_error() {
+        let root = temp_root("summary-unwritable");
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let path = root.join("missing-dir").join("step.md");
+        let cli = Cli::parse_from([
+            "mutator",
+            "--root",
+            root.to_str().unwrap(),
+            "--summary",
+            path.to_str().unwrap(),
+        ]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(&cli, &fake, &mut out, &mut err);
+        assert_eq!(code, 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("missing-dir"), "{text}");
+    }
+
+    #[test]
+    fn the_summary_counts_cache_hits_and_misses_for_a_partial_invalidation() {
+        let root = workspace_project("summary-partial");
+        let both = killed_all(&["app::m", "core::m"]);
+        execute_str(
+            &cached_run(&root, &[]),
+            &CacheFake::workspace(
+                &root,
+                workspace_metadata(&root),
+                WORKSPACE_LIST,
+                vec![(0, both.as_str())],
+            ),
+        );
+        // Only app changes, so core's verdict is reused and app's is a miss.
+        std::fs::write(
+            root.join("crates/app/src/lib.rs"),
+            "pub fn app() { let _ = 1; }\n",
+        )
+        .unwrap();
+        let path = root.join("step.md");
+        let second = CacheFake::workspace(
+            &root,
+            workspace_metadata(&root),
+            WORKSPACE_LIST,
+            vec![(0, killed("app::m").as_str())],
+        );
+        let (code, _) = execute_str(
+            &cached_run(&root, &["--summary", path.to_str().unwrap()]),
+            &second,
+        );
+        assert_eq!(code, 0);
+        let summary = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            summary.contains("Cache: 1 hit, 1 miss, 1 killed verdict reused"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn a_run_without_cache_never_reports_cache_numbers() {
+        let root = temp_root("summary-no-cache");
+        let path = root.join("step.md");
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (code, _) = execute_str(
+            &run_at(&root, &["--summary", path.to_str().unwrap()]),
+            &fake,
+        );
+        assert_eq!(code, 0);
+        let summary = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !summary.contains("Cache:"),
+            "no flag stores nothing, so no hit or miss exists: {summary}"
+        );
+    }
+
+    #[test]
     fn accepting_an_unknown_id_fails() {
         let root = temp_root("accept-unknown");
         let fake = Fake::new(LIST, vec![], vec![]);
@@ -1682,6 +1830,10 @@ mod tests {
         assert_eq!(code, 0, "{text}");
         assert_eq!(second.runs_started.borrow().len(), 1);
         assert!(text.contains("1 survivors decided again"), "{text}");
+        assert!(
+            text.contains(", 0 misses"),
+            "the only pending mutant had a stored verdict, so nothing was a miss: {text}"
+        );
     }
 
     #[test]
