@@ -3,6 +3,10 @@
     nixpkgs.url = "github:NixOS/nixpkgs";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
+    git-hooks.url = "github:cachix/git-hooks.nix";
+    git-hooks.inputs.nixpkgs.follows = "nixpkgs";
+    treefmt-nix.url = "github:numtide/treefmt-nix";
+    treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     rust-overlay.url = "github:oxalica/rust-overlay";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     crane.url = "github:ipetkov/crane";
@@ -12,11 +16,18 @@
     {
       nixpkgs,
       flake-parts,
+      git-hooks,
+      treefmt-nix,
       rust-overlay,
       crane,
       ...
     }@inputs:
     flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [
+        git-hooks.flakeModule
+        treefmt-nix.flakeModule
+      ];
+
       flake = {
         # `imports = [ inputs.mutator.flakeModules.default ]` then
         # `perSystem.mutator = { enable = true; check = true; };`
@@ -107,21 +118,6 @@
                 inherit cargoArtifacts;
               }
             );
-
-            # One check per linter, so a failure names the tool. `nixfmt-tree` is
-            # not a linter: it only rewrites, so `nix fmt` covers formatting.
-            actionlint = pkgs.runCommandLocal "actionlint" { nativeBuildInputs = [ pkgs.actionlint ]; } ''
-              actionlint -color ${./.}/.github/workflows/*.yaml
-              touch $out
-            '';
-            deadnix = pkgs.runCommandLocal "deadnix" { nativeBuildInputs = [ pkgs.deadnix ]; } ''
-              deadnix --fail ${./.}
-              touch $out
-            '';
-            statix = pkgs.runCommandLocal "statix" { nativeBuildInputs = [ pkgs.statix ]; } ''
-              statix check ${./.}
-              touch $out
-            '';
           };
 
           devShells.default = pkgs.mkShellNoCC {
@@ -151,9 +147,21 @@
             inherit mutator;
           };
 
-          # Formatting only. `nixfmt-tree` bundles nixfmt and the treefmt config
-          # that drives it, so the formatter needs no module and no config file.
-          formatter = pkgs.nixfmt-tree;
+          pre-commit.settings = {
+            hooks = {
+              actionlint.enable = true;
+              deadnix.enable = true;
+              statix.enable = true;
+            };
+            package = pkgs.prek;
+          };
+
+          treefmt = {
+            projectRootFile = "flake.nix";
+            programs = {
+              nixfmt.enable = true;
+            };
+          };
         };
 
       systems = [
