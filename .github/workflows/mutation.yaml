@@ -24,9 +24,16 @@ env:
 jobs:
   # The tool's own score must stay at 100%: every mutant cargo-mutants can generate
   # is killed by this crate's tests.
+  #
+  # This run is cold: every commit changes the crate, so the fingerprint misses and
+  # all 428 mutants are built and tested. The same work varies a lot between
+  # hosted runners. Run 45173489766 took 21m08s. Run 45173146724 reached the
+  # 30-minute mark and was cancelled, and its gate printed `score: 100.00%` two
+  # seconds after that mark, so nothing was wrong but the budget. A cancel also
+  # skips the cache save, so the budget is sized past the slow end of the spread.
   self:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: DeterminateSystems/nix-installer-action@129f07902485941992791c670de648dbe572a9ac # v3
