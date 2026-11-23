@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::accept::Accepted;
 use crate::error::{Error, Result};
 use crate::mutant::{Mutant, MutantId};
+use crate::scope::{Reason, Scope};
 
 /// What one `cargo-mutants` run said about a mutant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +158,8 @@ pub struct Counts {
 pub struct Summary {
     pub rows: Vec<Row>,
     pub scope: String,
+    /// Why the scope is wider than the diff's touched functions.
+    pub selection: Reason,
     pub scope_total: usize,
     pub stale: Vec<String>,
     /// Mutants settled by a stored verdict instead of a run: caught, then missed.
@@ -275,7 +278,7 @@ pub fn build(
     selected: &[(&Mutant, MutantId)],
     records: &[Record],
     accepted: &Accepted,
-    scope: String,
+    scope: Scope,
     scope_total: usize,
     stale: Vec<String>,
 ) -> Summary {
@@ -299,7 +302,8 @@ pub fn build(
     });
     Summary {
         rows,
-        scope,
+        scope: scope.label,
+        selection: scope.reason,
         scope_total,
         stale,
         reused: (0, 0),
@@ -338,6 +342,9 @@ pub fn render_text(summary: &Summary) -> String {
         summary.scope_total,
         summary.scope
     );
+    if let Some(reason) = summary.selection.describe() {
+        let _ = writeln!(text, "{reason}");
+    }
     for row in &summary.rows {
         let _ = writeln!(
             text,
@@ -383,6 +390,7 @@ struct JsonReport<'a> {
     #[serde(rename = "schemaVersion")]
     schema_version: u32,
     scope: &'a str,
+    selection: &'a Reason,
     counts: Counts,
     detected: usize,
     decided: usize,
@@ -410,6 +418,7 @@ pub fn render_json(summary: &Summary) -> Result<String> {
     let report = JsonReport {
         schema_version: 1,
         scope: &summary.scope,
+        selection: &summary.selection,
         counts: summary.counts(),
         detected: summary.detected(),
         decided: summary.decided(),
@@ -557,7 +566,7 @@ mod tests {
             &[],
             &[],
             &Accepted::default(),
-            "diff since main".to_owned(),
+            Scope::touched("diff since main"),
             0,
             vec![],
         );
@@ -575,7 +584,7 @@ mod tests {
             &selected(&mutants, &ids),
             &[record("a", Outcome::Failure)],
             &Accepted::default(),
-            "all mutants".to_owned(),
+            Scope::all(),
             2,
             vec![],
         );
@@ -592,7 +601,7 @@ mod tests {
             &selected(&mutants, &ids),
             &[record("a", Outcome::Missed)],
             &accepted,
-            "all mutants".to_owned(),
+            Scope::all(),
             1,
             vec![],
         );
@@ -618,7 +627,7 @@ mod tests {
             &selected(&mutants, &ids),
             &records,
             &Accepted::default(),
-            "all mutants".to_owned(),
+            Scope::all(),
             3,
             vec![],
         );
@@ -652,7 +661,7 @@ mod tests {
                 &selected(&mutants, &ids),
                 &records,
                 &Accepted::default(),
-                "all mutants".to_owned(),
+                Scope::all(),
                 total,
                 vec![],
             );
@@ -673,7 +682,7 @@ mod tests {
             &selected(&mutants, &ids),
             &[record("a", Outcome::Missed)],
             &Accepted::default(),
-            "all mutants".to_owned(),
+            Scope::all(),
             1,
             vec![],
         );
@@ -694,7 +703,7 @@ mod tests {
             &selected(&mutants, &ids),
             &[],
             &Accepted::default(),
-            "all mutants".to_owned(),
+            Scope::all(),
             1,
             vec![],
         );
@@ -713,7 +722,7 @@ mod tests {
             &selected(&mutants, &ids),
             &records,
             &Accepted::default(),
-            "all mutants".to_owned(),
+            Scope::all(),
             2,
             vec![],
         );
@@ -754,7 +763,7 @@ mod tests {
             &selected(&mutants, &ids),
             &records,
             &accepted,
-            "all mutants".to_owned(),
+            Scope::all(),
             6,
             vec![],
         );
@@ -788,7 +797,7 @@ mod tests {
             &selected(&mutants, &ids),
             &records,
             &Accepted::default(),
-            "all mutants".to_owned(),
+            Scope::all(),
             42,
             vec!["stale#0".to_owned()],
         );
@@ -809,13 +818,14 @@ mod tests {
             &selected(&mutants, &ids),
             &[record(&mutants[0].name, Outcome::Caught)],
             &Accepted::default(),
-            "diff since main".to_owned(),
+            Scope::touched("diff since main"),
             7,
             vec![],
         );
         assert_eq!(
             render_json(&summary).unwrap(),
             "{\"schemaVersion\":1,\"scope\":\"diff since main\",\
+             \"selection\":{\"reason\":\"Touched\"},\
              \"counts\":{\"caught\":1,\"missed\":0,\"timeout\":0,\"unviable\":0,\"accepted\":0,\"not_run\":0},\
              \"detected\":1,\"decided\":1,\"scoreBp\":10000,\
              \"rows\":[{\"id\":\"src/lib.rs::parse::FnValue::0#0\",\
@@ -832,7 +842,7 @@ mod tests {
             &selected(&mutants, &ids),
             &[record(&mutants[0].name, Outcome::Missed)],
             &Accepted::default(),
-            "all mutants".to_owned(),
+            Scope::all(),
             1,
             vec!["gone#0".to_owned()],
         );

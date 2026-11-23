@@ -11,6 +11,7 @@ A pull request runs only the mutants its diff can affect, and fails when one sur
 `mutator` keeps `cargo-mutants` as the mutation engine and adds the parts that make it usable per change:
 
 - **Diff selection.** A mutant is in scope when the function that encloses it overlaps a line the diff changed. A deleted line counts as touching the line it collapsed onto.
+- **Test and manifest changes widen the scope.** A new test can kill a mutant whose function never moved, so a diff touching a `tests/` file or a `Cargo.toml` selects every mutant of the package that owns it. A changed file no package owns selects the whole workspace, because nothing proves which mutants it can observe.
 - **Exact selection.** The selected mutants reach `cargo-mutants` as one anchored regex, so a run tests those mutants and no neighbours. Verdicts come back from `mutants.out/outcomes.json` rather than from matching console text.
 - **Stable identity.** A mutant's id is `file::function::genre::replacement#ordinal`. Line numbers are not part of it, so editing above a mutant does not invalidate its accepted-equivalent entry.
 - **Accepted equivalents.** `mutator accept <id> --reason "…"` records a mutant no input can observe in `mutator.accepted.json`, which you commit. The entry leaves the score and the gate, and the report lists entries whose mutant is gone.
@@ -148,10 +149,19 @@ score: 50.00% (1 detected, 1 missed, 0 accepted, 0 unviable, 0 not run)
 cache: 1 killed verdict reused, 0 survivors decided again
 ```
 
+A diff that only changed tests prints the reason the scope is wider than the functions it touched:
+
+```
+mutator: 270 of 309 mutants in scope (diff since main)
+selection: 1 test file changed, so every mutant of mutator is in scope
+  ...
+```
+
 `--reporter json` emits one document with a stable field order:
 
 ```json
 {"schemaVersion":1,"scope":"diff since main",
+ "selection":{"reason":"Packages","packages":["mutator"],"files":["tests/cli.rs"]},
  "counts":{"caught":1,"missed":1,"timeout":0,"unviable":0,"accepted":0,"not_run":0},
  "detected":1,"decided":2,"scoreBp":5000,
  "rows":[{"id":"src/lib.rs::parse::FnValue::0#0","name":"…","file":"src/lib.rs",
@@ -159,7 +169,7 @@ cache: 1 killed verdict reused, 0 survivors decided again
  "staleAccepted":[],"reused":{"caught":0,"missed":0}}
 ```
 
-`status` is one of `Caught`, `Missed`, `Timeout`, `Unviable`, `Accepted`, `NotRun`. `--reporter github` prints `::warning` annotations for survivors and `::notice` for stale accepted entries.
+`selection.reason` is `All`, `Touched`, `Packages`, or `Workspace`. `status` is one of `Caught`, `Missed`, `Timeout`, `Unviable`, `Accepted`, `NotRun`. `--reporter github` prints `::warning` annotations for survivors and `::notice` for stale accepted entries.
 
 ### Exit codes
 
@@ -187,6 +197,8 @@ The id comes from the report. An accepted entry is reported as `ACCEPTED`, stays
 That is deliberately the whole package: `cargo-mutants` rebuilds and reruns a package's tests for each mutant, so any file in the package can change a verdict. The cost is that editing one test re-runs every mutant of that package. The benefit is that reuse needs no coverage data and can be wrong in only one direction: it decides nothing the tests would not have decided.
 
 A reused kill is reported as `KILLED` and counted exactly like a fresh one. A stored survivor still runs, since a survivor means "no test observed this mutant" and a new test can change that without touching the package's source. Nothing is read or written without the flag.
+
+A changed test or manifest that no package owns, such as a workspace-level `tests/` directory or `Cargo.lock`, turns reuse off for that run. The run cannot tell which stores the file could change, so it decides every selected verdict again instead of trusting one.
 
 Measured on this crate: 2m48s cold, 10.8s warm, 270 of 270 verdicts reused, identical score.
 
@@ -228,6 +240,7 @@ The gate runs on every push to `main` and every pull request, and the `diff` job
 ## Limits
 
 - Selection follows function spans. A change to a function pulls in every mutant of that function, which is intentional but coarser than a line-level filter when a function is large.
-- A diff that only edits a test file selects nothing, since no mutant moved. Rerun with `--all` after changing tests.
+- A test or manifest change widens the selection to whole packages, so a one-line test edit in a large crate runs all of that crate's mutants. `--all` is the explicit override for a wider sweep.
+- Ownership comes from `cargo metadata`. A changed test or manifest that no member owns, such as a workspace-level `tests/` directory or `Cargo.lock`, selects every mutant rather than guessing which package could observe it.
 - The score covers mutants this run selected. It is a measurement of the change, not of the repository.
 - Reuse is per package. A workspace with one large crate gets less from `--cache` than one split into small crates.

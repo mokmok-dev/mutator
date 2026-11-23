@@ -1,6 +1,6 @@
 //! Unified diff parsing and line-range intersection.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::Deserialize;
@@ -73,10 +73,11 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// The new-side lines each file's hunks touch.
+/// The new-side lines each file's hunks touch, and every path the diff names.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Diff {
     files: BTreeMap<String, Vec<LineRange>>,
+    paths: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,15 +96,24 @@ impl Diff {
     /// Returns the input line of a hunk header that is not `@@ -a,b +c,d @@`.
     pub fn parse(text: &str) -> Result<Self, ParseError> {
         let mut files = BTreeMap::<String, Vec<LineRange>>::new();
+        let mut paths = BTreeSet::<String>::new();
         let mut path: Option<String> = None;
         let mut state = State::Header;
         for (index, raw) in text.lines().enumerate() {
             if let Some(rest) = raw.strip_prefix("diff --git ") {
+                // A rename names both sides, and each one can hold a changed test.
+                if let Some((old, new)) = rest.rsplit_once(" b/") {
+                    paths.insert(old.strip_prefix("a/").unwrap_or(old).to_owned());
+                    paths.insert(new.to_owned());
+                }
                 path = rest.rsplit_once(" b/").map(|(_, new)| new.to_owned());
                 state = State::Header;
             } else if state == State::Header && raw.starts_with("+++ ") {
                 // `+++ /dev/null` marks a deletion; `strip_prefix` then yields no path.
                 path = raw.strip_prefix("+++ b/").map(str::to_owned);
+                if let Some(new) = path.as_ref() {
+                    paths.insert(new.clone());
+                }
             } else if let Some(rest) = raw.strip_prefix("@@ ") {
                 let range = parse_hunk(rest).ok_or_else(|| ParseError {
                     line: index.saturating_add(1),
@@ -115,13 +125,21 @@ impl Diff {
                 }
             }
         }
-        Ok(Self { files })
+        Ok(Self { files, paths })
     }
 
     pub fn files(&self) -> impl Iterator<Item = (&str, &[LineRange])> {
         self.files
             .iter()
             .map(|(path, ranges)| (path.as_str(), ranges.as_slice()))
+    }
+
+    /// Every path the diff names, whether or not a hunk touches it.
+    ///
+    /// A deletion and a rename also name the path they removed, so a selector can
+    /// notice a changed test file that no new-side range describes.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.paths.iter().map(String::as_str)
     }
 
     /// Whether any hunk on `path` touches `span`'s lines.
@@ -241,6 +259,35 @@ mod tests {
         let diff = Diff::parse(text).unwrap();
         assert_eq!(diff.files().count(), 0);
         assert!(!diff.intersects("gone.rs", 1, 10));
+        assert_eq!(diff.paths().collect::<Vec<_>>(), vec!["gone.rs"]);
+    }
+
+    #[test]
+    fn a_rename_names_both_sides() {
+        let text = "diff --git a/tests/old.rs b/tests/new.rs\n\
+                    similarity index 100%\n\
+                    rename from tests/old.rs\n\
+                    rename to tests/new.rs\n";
+        let diff = Diff::parse(text).unwrap();
+        assert_eq!(
+            diff.paths().collect::<Vec<_>>(),
+            vec!["tests/new.rs", "tests/old.rs"]
+        );
+        assert_eq!(diff.files().count(), 0);
+    }
+
+    #[test]
+    fn a_file_with_hunks_is_named_once() {
+        let text = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n";
+        let diff = Diff::parse(text).unwrap();
+        assert_eq!(diff.paths().collect::<Vec<_>>(), vec!["a.rs"]);
+    }
+
+    #[test]
+    fn a_header_without_hunks_still_names_its_path() {
+        let text = "diff --git a/src/x.rs b/src/x.rs\n";
+        let diff = Diff::parse(text).unwrap();
+        assert_eq!(diff.paths().collect::<Vec<_>>(), vec!["src/x.rs"]);
     }
 
     #[test]
@@ -277,6 +324,7 @@ mod tests {
                     next = range.end.saturating_add(1);
                     ranges.push(range);
                 }
+                diff.paths.insert(path.clone());
                 diff.files.insert(path, ranges);
             }
             diff

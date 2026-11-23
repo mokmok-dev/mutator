@@ -14,6 +14,7 @@ use crate::error::{Error, Result};
 use crate::exec::{self, Exec, Real};
 use crate::mutant::{self, Mutant, MutantId};
 use crate::report::{self, Gate, GateResult, Outcome, Record, Summary};
+use crate::scope::{self, Scope};
 
 /// Mutants per `cargo mutants` invocation. Each one repeats the baseline, so keep it large.
 const CHUNK: usize = 400;
@@ -275,8 +276,9 @@ pub fn execute(
         .collect();
 
     // Accepted entries never run. With `--cache`, a mutant whose package is
-    // byte-for-byte unchanged is decided from its stored verdict instead.
-    let decision = if run.cache {
+    // byte-for-byte unchanged is decided from its stored verdict instead, unless a
+    // changed file sits outside every package and can invalidate the verdict.
+    let decision = if run.cache && scope.reason.reuses_verdicts() {
         session.decide(&root, &selected, &accepted)?
     } else {
         Decision::none(&selected, &accepted)
@@ -495,14 +497,18 @@ impl Session<'_> {
         mutant::parse_list(&output.stdout)
     }
 
-    /// The scope label and the indices of the selected mutants.
+    /// The scope and the indices of the selected mutants.
+    ///
+    /// A diff that only touches tests or manifests selects nothing by function
+    /// span, so those paths widen the scope to the packages they belong to. A
+    /// path no package owns widens it to the whole workspace.
     fn scope(
         &mut self,
         selection: &Selection,
         root: &Path,
         mutants: &[Mutant],
-    ) -> Result<(String, Vec<usize>)> {
-        let (scope, diff) = if let Some(path) = &selection.diff {
+    ) -> Result<(Scope, Vec<usize>)> {
+        let (label, diff) = if let Some(path) = &selection.diff {
             let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
                 path: path.clone(),
                 source,
@@ -527,15 +533,32 @@ impl Session<'_> {
             })?;
             (format!("diff since {revision}"), diff)
         } else {
-            return Ok(("all mutants".to_owned(), (0..mutants.len()).collect()));
+            return Ok((Scope::all(), (0..mutants.len()).collect()));
         };
-        let selected = mutants
-            .iter()
-            .enumerate()
-            .filter(|(_, mutant)| diff.touching(&mutant.file, mutant.enclosing_span()))
-            .map(|(index, _)| index)
-            .collect();
-        Ok((scope, selected))
+        if !scope::widens(&diff) {
+            let selected = mutants
+                .iter()
+                .enumerate()
+                .filter(|(_, mutant)| diff.touching(&mutant.file, mutant.enclosing_span()))
+                .map(|(index, _)| index)
+                .collect();
+            return Ok((Scope::touched(label), selected));
+        }
+        let (reason, selected) = scope::widen(&diff, &self.packages(root)?, mutants);
+        Ok((Scope { label, reason }, selected))
+    }
+
+    /// Each workspace member's directory, relative to the project root.
+    fn packages(&mut self, root: &Path) -> Result<BTreeMap<String, PathBuf>> {
+        Ok(cache::package_dirs(root, self.exec)?
+            .into_iter()
+            .map(|(name, dir)| {
+                let relative = dir
+                    .strip_prefix(root)
+                    .map_or_else(|_| dir.clone(), Path::to_path_buf);
+                (name, relative)
+            })
+            .collect())
     }
 
     fn run_mutants(&mut self, root: &Path, pending: &[&Mutant]) -> Result<Ran> {
@@ -665,6 +688,24 @@ mod tests {
 
     const DIFF: &str = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -21,1 +21,1 @@\n-old\n+new\n";
 
+    const TEST_DIFF: &str = "diff --git a/tests/t.rs b/tests/t.rs\n--- a/tests/t.rs\n+++ b/tests/t.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+
+    const DELETED_TEST_DIFF: &str = "diff --git a/tests/t.rs b/tests/t.rs\n--- a/tests/t.rs\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-x\n";
+
+    const RENAMED_TEST_DIFF: &str = "diff --git a/tests/old.rs b/tests/new.rs\n\
+        similarity index 100%\n\
+        rename from tests/old.rs\n\
+        rename to tests/new.rs\n";
+
+    /// `cargo metadata` output for one package whose manifest sits in `dir`.
+    fn metadata_json(root: &Path, dir: &str, package: &str) -> String {
+        let manifest = root.join(dir).join("Cargo.toml");
+        format!(
+            r#"{{"packages":[{{"name":"{package}","manifest_path":"{}"}}]}}"#,
+            manifest.display()
+        )
+    }
+
     /// Answers each command from the queue and writes outcomes where `cargo mutants` would.
     struct Fake {
         list: String,
@@ -673,6 +714,8 @@ mod tests {
         run_index: RefCell<usize>,
         calls: RefCell<Vec<Vec<String>>>,
         all_caught: bool,
+        /// Where `cargo metadata` says the one package's manifest sits, relative to the root.
+        package_dir: &'static str,
     }
 
     impl Fake {
@@ -688,6 +731,7 @@ mod tests {
                 run_index: RefCell::new(0),
                 calls: RefCell::new(Vec::new()),
                 all_caught: false,
+                package_dir: "",
             }
         }
 
@@ -739,6 +783,9 @@ mod tests {
                         ),
                     }
                 });
+            }
+            if program == "cargo" && args.first().is_some_and(|arg| arg == "metadata") {
+                return Ok(ok(&metadata_json(cwd, self.package_dir, "mutator")));
             }
             if args.iter().any(|arg| arg == "--list") {
                 return Ok(ok(&self.list));
@@ -1083,6 +1130,8 @@ mod tests {
         root: PathBuf,
         runs: RefCell<std::collections::VecDeque<(i32, String)>>,
         runs_started: RefCell<Vec<Vec<String>>>,
+        /// Where `cargo metadata` says the one package's manifest sits, relative to the root.
+        package_dir: &'static str,
     }
 
     impl CacheFake {
@@ -1095,6 +1144,7 @@ mod tests {
                         .collect(),
                 ),
                 runs_started: RefCell::new(Vec::new()),
+                package_dir: "",
             }
         }
     }
@@ -1104,6 +1154,7 @@ mod tests {
             if program == "cargo" && args.first().is_some_and(|a| a == "metadata") {
                 let name = self
                     .root
+                    .join(self.package_dir)
                     .join("Cargo.toml")
                     .to_str()
                     .map_or_else(String::new, str::to_owned);
@@ -1269,6 +1320,210 @@ mod tests {
         assert_eq!(code, 0, "{text}");
         assert!(text.contains("ACCEPTED"), "{text}");
         assert!(second.runs_started.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_test_only_diff_selects_its_packages_mutants_rather_than_passing() {
+        let root = temp_root("test-only");
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, TEST_DIFF).unwrap();
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (code, text) = execute_str(&run_at(&root, &["--diff", diff.to_str().unwrap()]), &fake);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.starts_with("mutator: 2 of 2 mutants in scope (diff "),
+            "{text}"
+        );
+        assert!(
+            text.contains("selection: 1 test file changed, so every mutant of mutator is in scope"),
+            "{text}"
+        );
+        assert_eq!(fake.run_calls().len(), 1, "both mutants must be run");
+    }
+
+    #[test]
+    fn a_test_only_diff_reports_a_survivor_instead_of_silently_passing() {
+        let root = temp_root("test-kills");
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, TEST_DIFF).unwrap();
+        let fake = Fake::new(LIST, vec![(2, ONE_MISSED)], vec![]);
+        let (code, text) = execute_str(
+            &run_at(
+                &root,
+                &["--diff", diff.to_str().unwrap(), "--fail-on-survived"],
+            ),
+            &fake,
+        );
+        assert_eq!(code, 2, "the survivor must fail the gate: {text}");
+        assert!(text.contains("1 missed mutant"), "{text}");
+    }
+
+    #[test]
+    fn a_test_diff_widens_the_scope_in_the_json_report() {
+        let root = temp_root("test-only-json");
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, TEST_DIFF).unwrap();
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (_, text) = execute_str(
+            &run_at(
+                &root,
+                &["--diff", diff.to_str().unwrap(), "--reporter", "json"],
+            ),
+            &fake,
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["selection"]["reason"], "Packages");
+        assert_eq!(value["selection"]["packages"][0], "mutator");
+        assert_eq!(value["rows"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn a_deleted_test_file_widens_the_scope() {
+        let root = temp_root("test-deleted");
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, DELETED_TEST_DIFF).unwrap();
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (code, text) = execute_str(&run_at(&root, &["--diff", diff.to_str().unwrap()]), &fake);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains("selection: 1 test file changed, so every mutant of mutator is in scope"),
+            "{text}"
+        );
+        assert_eq!(fake.run_calls().len(), 1);
+    }
+
+    #[test]
+    fn a_renamed_test_file_widens_the_scope() {
+        let root = temp_root("test-renamed");
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, RENAMED_TEST_DIFF).unwrap();
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (code, text) = execute_str(&run_at(&root, &["--diff", diff.to_str().unwrap()]), &fake);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains(
+                "selection: 2 test files changed, so every mutant of mutator is in scope"
+            ),
+            "{text}"
+        );
+        assert_eq!(fake.run_calls().len(), 1);
+    }
+
+    #[test]
+    fn a_new_test_that_kills_a_missed_mutant_produces_an_updated_result() {
+        let root = temp_root("test-kills-updated");
+        let first = Fake::new(LIST, vec![(2, ONE_MISSED)], vec![]);
+        let (code, text) = execute_str(&run_at(&root, &["--fail-on-survived"]), &first);
+        assert_eq!(
+            code, 2,
+            "the mutant is missed before the test exists: {text}"
+        );
+
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, TEST_DIFF).unwrap();
+        let second = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (code, text) = execute_str(
+            &run_at(
+                &root,
+                &["--diff", diff.to_str().unwrap(), "--fail-on-survived"],
+            ),
+            &second,
+        );
+        assert_eq!(code, 0, "the new test kills it, so the gate passes: {text}");
+        assert!(text.contains("2 detected, 0 missed"), "{text}");
+    }
+
+    #[test]
+    fn a_test_outside_every_package_selects_the_whole_workspace() {
+        let root = temp_root("test-unowned");
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, TEST_DIFF).unwrap();
+        let fake = Fake {
+            package_dir: "crates/app",
+            ..Fake::new(LIST, vec![(0, BOTH)], vec![])
+        };
+        let (code, text) = execute_str(&run_at(&root, &["--diff", diff.to_str().unwrap()]), &fake);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains("every mutant is in scope because tests/t.rs belongs to no package"),
+            "{text}"
+        );
+        assert_eq!(fake.run_calls().len(), 1, "both mutants must be run");
+    }
+
+    #[test]
+    fn a_production_diff_prints_no_selection_reason() {
+        let root = temp_root("touched-only");
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, DIFF).unwrap();
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (_, text) = execute_str(&run_at(&root, &["--diff", diff.to_str().unwrap()]), &fake);
+        assert!(!text.contains("selection:"), "{text}");
+    }
+
+    #[test]
+    fn a_new_test_in_a_package_forces_a_rerun_so_a_missed_mutant_can_be_killed() {
+        let root = cache_project("test-only-cache");
+        execute_str(
+            &cached_run(&root, &["--fail-on-survived"]),
+            &CacheFake::new(&root, vec![(2, survived("m1").as_str())]),
+        );
+
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/t.rs"), "#[test]\nfn t() {}\n").unwrap();
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, TEST_DIFF).unwrap();
+
+        let second = CacheFake::new(&root, vec![(0, killed("m1").as_str())]);
+        let (code, text) = execute_str(
+            &cached_run(
+                &root,
+                &["--diff", diff.to_str().unwrap(), "--fail-on-survived"],
+            ),
+            &second,
+        );
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(
+            second.runs_started.borrow().len(),
+            1,
+            "the changed test must force a run: {text}"
+        );
+        assert!(!text.contains("reused"), "{text}");
+    }
+
+    #[test]
+    fn a_test_outside_every_package_reuses_no_stored_verdict() {
+        let root = cache_project("test-unowned-cache");
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, TEST_DIFF).unwrap();
+        let first = CacheFake {
+            package_dir: "crates/app",
+            ..CacheFake::new(&root, vec![(0, killed("m1").as_str())])
+        };
+        let (code, text) = execute_str(
+            &cached_run(&root, &["--diff", diff.to_str().unwrap()]),
+            &first,
+        );
+        assert_eq!(code, 0, "{text}");
+
+        let second = CacheFake {
+            package_dir: "crates/app",
+            ..CacheFake::new(&root, vec![(0, killed("m1").as_str())])
+        };
+        let (code, text) = execute_str(
+            &cached_run(
+                &root,
+                &["--diff", diff.to_str().unwrap(), "--fail-on-survived"],
+            ),
+            &second,
+        );
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(
+            second.runs_started.borrow().len(),
+            1,
+            "a path no package fingerprints must not be settled from the store: {text}"
+        );
+        assert!(!text.contains("reused"), "{text}");
     }
 
     #[test]

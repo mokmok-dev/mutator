@@ -19,5 +19,6 @@ pub mod error;
 pub mod exec;
 pub mod mutant;
 pub mod report;
+pub mod scope;
 
 pub use error::{Error, Result};
