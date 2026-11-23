@@ -56,7 +56,8 @@ pub struct Run {
     #[arg(long, value_enum, default_value = "text")]
     pub reporter: Vec<Reporter>,
 
-    /// Print the selected mutant names and run nothing.
+    /// Print the selected mutant names and run nothing. The reason a scope is wider
+    /// than the functions the diff touched goes to stderr.
     #[arg(long)]
     pub list: bool,
 
@@ -251,12 +252,18 @@ pub fn execute(
         cached_packages: Vec::new(),
     };
     let root = run.project.root()?;
+    // Parse the diff before listing mutants, so a malformed diff is reported as
+    // such even when `cargo-mutants` is missing.
+    let diff = session.diff(&run.selection, &root)?;
     let mutants = session.list(&root)?;
     let ids = mutant::assign_ids(&mutants);
     let accepted = Accepted::load(&root)?;
-    let (scope, selection) = session.scope(&run.selection, &root, &mutants)?;
+    let (scope, selection) = session.scope(diff.as_ref(), &root, &mutants)?;
 
     if run.list {
+        if let Some(reason) = scope.reason.describe() {
+            writeln!(err, "{reason}")?;
+        }
         for index in &selection {
             writeln!(out, "{}", mutants[*index].name)?;
         }
@@ -507,17 +514,10 @@ impl Session<'_> {
         mutant::parse_list(&output.stdout)
     }
 
-    /// The scope and the indices of the selected mutants.
+    /// The diff a run selects from, labelled by where it came from.
     ///
-    /// A diff that only touches tests or manifests selects nothing by function
-    /// span, so those paths widen the scope to the packages they belong to. A
-    /// path no package owns widens it to the whole workspace.
-    fn scope(
-        &mut self,
-        selection: &Selection,
-        root: &Path,
-        mutants: &[Mutant],
-    ) -> Result<(Scope, Vec<usize>)> {
+    /// `None` when the run selects every mutant.
+    fn diff(&mut self, selection: &Selection, root: &Path) -> Result<Option<(String, Diff)>> {
         let (label, diff) = if let Some(path) = &selection.diff {
             let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
                 path: path.clone(),
@@ -543,19 +543,41 @@ impl Session<'_> {
             })?;
             (format!("diff since {revision}"), diff)
         } else {
+            return Ok(None);
+        };
+        Ok(Some((label, diff)))
+    }
+
+    /// The scope and the indices of the selected mutants.
+    ///
+    /// A diff that only touches tests or manifests selects nothing by function
+    /// span, so those paths widen the scope to the packages they belong to. So does
+    /// a source change outside every function span. A path no package owns widens
+    /// it to the whole workspace.
+    fn scope(
+        &mut self,
+        diff: Option<&(String, Diff)>,
+        root: &Path,
+        mutants: &[Mutant],
+    ) -> Result<(Scope, Vec<usize>)> {
+        let Some((label, diff)) = diff else {
             return Ok((Scope::all(), (0..mutants.len()).collect()));
         };
-        if !scope::widens(&diff) {
-            let selected = mutants
-                .iter()
-                .enumerate()
-                .filter(|(_, mutant)| diff.touching(&mutant.file, mutant.enclosing_span()))
-                .map(|(index, _)| index)
-                .collect();
-            return Ok((Scope::touched(label), selected));
-        }
-        let (reason, selected) = scope::widen(&diff, &self.packages(root)?, mutants);
-        Ok((Scope { label, reason }, selected))
+        // Ownership comes from `cargo metadata`, which costs a process per run, so
+        // only ask when a changed path actually needs a package fallback.
+        let packages = if scope::widens(diff, mutants) {
+            self.packages(root)?
+        } else {
+            BTreeMap::new()
+        };
+        let (reason, selected) = scope::select(diff, &packages, mutants);
+        Ok((
+            Scope {
+                label: label.clone(),
+                reason,
+            },
+            selected,
+        ))
     }
 
     /// Each workspace member's directory, relative to the project root.
@@ -952,9 +974,12 @@ mod tests {
         assert_eq!(code, 0);
         assert!(text.contains("(diff since main)"), "{text}");
         let calls = fake.calls();
-        assert_eq!(calls[1], vec!["merge-base", "main", "HEAD"]);
-        assert_eq!(calls[2][0], "diff");
-        assert_eq!(calls[2].last().map(String::as_str), Some("abc123"));
+        // The diff is resolved before `cargo mutants --list`, so a malformed diff
+        // fails even when the tool is missing.
+        assert_eq!(calls[0], vec!["merge-base", "main", "HEAD"]);
+        assert_eq!(calls[1][0], "diff");
+        assert_eq!(calls[1].last().map(String::as_str), Some("abc123"));
+        assert!(calls[2].iter().any(|arg| arg == "--list"));
     }
 
     #[test]
@@ -977,7 +1002,7 @@ mod tests {
         let diff = root.join("x.diff");
         std::fs::write(
             &diff,
-            "diff --git a/other.rs b/other.rs\n--- a/other.rs\n+++ b/other.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n",
+            "diff --git a/docs/guide.md b/docs/guide.md\n--- a/docs/guide.md\n+++ b/docs/guide.md\n@@ -1,1 +1,1 @@\n-a\n+b\n",
         )
         .unwrap();
         let fake = Fake::new(LIST, vec![], vec![]);
@@ -991,6 +1016,33 @@ mod tests {
         assert_eq!(code, 0);
         assert!(text.contains("no mutants in scope"), "{text}");
         assert_eq!(fake.run_calls(), Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn a_source_file_with_no_mutants_selects_its_package_instead_of_passing() {
+        let root = temp_root("no-mutants-here");
+        let diff = root.join("x.diff");
+        std::fs::write(
+            &diff,
+            "diff --git a/other.rs b/other.rs\n--- a/other.rs\n+++ b/other.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n",
+        )
+        .unwrap();
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (code, text) = execute_str(
+            &run_at(
+                &root,
+                &["--diff", diff.to_str().unwrap(), "--fail-on-survived"],
+            ),
+            &fake,
+        );
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains(
+                "selection: 1 source file changed, so every mutant of mutator is in scope"
+            ),
+            "{text}"
+        );
+        assert_eq!(fake.run_calls().len(), 1, "both mutants must be run");
     }
 
     #[test]
@@ -1731,6 +1783,160 @@ mod tests {
         let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
         let (_, text) = execute_str(&run_at(&root, &["--diff", diff.to_str().unwrap()]), &fake);
         assert!(!text.contains("selection:"), "{text}");
+    }
+
+    #[test]
+    fn a_signature_change_selects_the_package() {
+        let root = temp_root("signature");
+        let diff = root.join("x.diff");
+        std::fs::write(
+            &diff,
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n\
+             @@ -5,1 +5,1 @@\n-fn parse(s: &str) -> u32 {\n+fn parse(s: String) -> u64 {\n",
+        )
+        .unwrap();
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (code, text) = execute_str(&run_at(&root, &["--diff", diff.to_str().unwrap()]), &fake);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains(
+                "selection: 1 source file changed, so every mutant of mutator is in scope"
+            ),
+            "{text}"
+        );
+        assert_eq!(fake.run_calls().len(), 1, "both mutants must be run");
+    }
+
+    #[test]
+    fn a_build_script_change_selects_the_package() {
+        let root = temp_root("build-script");
+        let diff = root.join("x.diff");
+        std::fs::write(
+            &diff,
+            "diff --git a/build.rs b/build.rs\n--- a/build.rs\n+++ b/build.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n",
+        )
+        .unwrap();
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (code, text) = execute_str(&run_at(&root, &["--diff", diff.to_str().unwrap()]), &fake);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains(
+                "selection: 1 build script changed, so every mutant of mutator is in scope"
+            ),
+            "{text}"
+        );
+        assert_eq!(fake.run_calls().len(), 1);
+    }
+
+    #[test]
+    fn a_shared_configuration_change_selects_the_whole_workspace() {
+        let root = temp_root("config");
+        let diff = root.join("x.diff");
+        std::fs::write(
+            &diff,
+            "diff --git a/.cargo/config.toml b/.cargo/config.toml\n--- a/.cargo/config.toml\n\
+             +++ b/.cargo/config.toml\n@@ -1,1 +1,1 @@\n-a\n+b\n",
+        )
+        .unwrap();
+        let fake = Fake {
+            package_dir: "crates/app",
+            ..Fake::new(LIST, vec![(0, BOTH)], vec![])
+        };
+        let (code, text) = execute_str(&run_at(&root, &["--diff", diff.to_str().unwrap()]), &fake);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains(
+                "every mutant is in scope because .cargo/config.toml belongs to no package"
+            ),
+            "{text}"
+        );
+        assert_eq!(fake.run_calls().len(), 1);
+    }
+
+    #[test]
+    fn a_renamed_source_file_selects_both_packages() {
+        let root = temp_root("source-renamed");
+        let diff = root.join("x.diff");
+        std::fs::write(
+            &diff,
+            "diff --git a/src/parse.rs b/src/scan.rs\nsimilarity index 100%\n\
+             rename from src/parse.rs\nrename to src/scan.rs\n",
+        )
+        .unwrap();
+        let fake = Fake::new(LIST, vec![(0, BOTH)], vec![]);
+        let (code, text) = execute_str(&run_at(&root, &["--diff", diff.to_str().unwrap()]), &fake);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains(
+                "selection: 2 source files changed, so every mutant of mutator is in scope"
+            ),
+            "{text}"
+        );
+        assert_eq!(fake.run_calls().len(), 1);
+    }
+
+    #[test]
+    fn list_explains_a_widened_selection_on_stderr() {
+        let root = temp_root("list-reason");
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, TEST_DIFF).unwrap();
+        let fake = Fake::new(LIST, vec![], vec![]);
+        let run = run_at(&root, &["--diff", diff.to_str().unwrap(), "--list"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = execute(&run, &fake, &mut out, &mut err).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "src/lib.rs:3:5: replace parse -> u32 with 0\n\
+             src/lib.rs:20:5: replace render -> u32 with 0\n"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "selection: 1 test file changed, so every mutant of mutator is in scope\n"
+        );
+    }
+
+    #[test]
+    fn a_malformed_diff_is_reported_before_cargo_mutants_is_asked_anything() {
+        let root = temp_root("bad-diff");
+        let diff = root.join("x.diff");
+        std::fs::write(
+            &diff,
+            "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ broken @@\n",
+        )
+        .unwrap();
+        let fake = Fake::new(LIST, vec![], vec![]);
+        let run = run_at(&root, &["--diff", diff.to_str().unwrap(), "--list"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let error = execute(&run, &fake, &mut out, &mut err).unwrap_err();
+        assert!(
+            matches!(&error, crate::error::Error::DiffFile { source, .. } if source.text == "@@ broken @@"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fake.calls(),
+            Vec::<Vec<String>>::new(),
+            "the diff must be parsed before any process runs"
+        );
+    }
+
+    #[test]
+    fn list_stays_quiet_when_the_diff_decided_alone() {
+        let root = temp_root("list-quiet");
+        let diff = root.join("x.diff");
+        std::fs::write(&diff, DIFF).unwrap();
+        let fake = Fake::new(LIST, vec![], vec![]);
+        let run = run_at(&root, &["--diff", diff.to_str().unwrap(), "--list"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(execute(&run, &fake, &mut out, &mut err).unwrap(), 0);
+        assert_eq!(String::from_utf8(err).unwrap(), "");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "src/lib.rs:20:5: replace render -> u32 with 0\n"
+        );
     }
 
     #[test]

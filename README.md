@@ -11,7 +11,8 @@ A pull request runs only the mutants its diff can affect, and fails when one sur
 `mutator` keeps `cargo-mutants` as the mutation engine and adds the parts that make it usable per change:
 
 - **Diff selection.** A mutant is in scope when the function that encloses it overlaps a line the diff changed. A deleted line counts as touching the line it collapsed onto.
-- **Test and manifest changes widen the scope.** A new test can kill a mutant whose function never moved, so a diff touching a `tests/` file or a `Cargo.toml` selects every mutant of the package that owns it. A changed file no package owns selects the whole workspace, because nothing proves which mutants it can observe.
+- **Anything a function span cannot represent widens the scope.** A changed test, build script or manifest selects every mutant of the package that owns it, and so does a source change no function span covers: a line outside every mutant's function, a signature, type, trait, constant, macro, import, or attribute. So does a deletion or a rename. A changed path no package owns, such as the workspace `Cargo.lock` or `.cargo/config.toml`, selects the whole workspace, because nothing proves which mutants it can observe. `--list` prints the reason on stderr.
+- **Selective is not exhaustive.** A run proves the mutants its change can reach. It is not a full-workspace sweep, and its score describes the selection.
 - **Exact selection.** The selected mutants reach `cargo-mutants` as one anchored regex, so a run tests those mutants and no neighbours. Verdicts come back from `mutants.out/outcomes.json` rather than from matching console text.
 - **Stable identity.** A mutant's id is `file::function::genre::replacement#ordinal`. Line numbers are not part of it, so editing above a mutant does not invalidate its accepted-equivalent entry.
 - **Accepted equivalents.** `mutator accept <id> --reason "…"` records a mutant no input can observe in `mutator.accepted.json`, which you commit. The entry leaves the score and the gate, and the report lists entries whose mutant is gone.
@@ -133,7 +134,7 @@ mutator --since main --cache --fail-on-survived
 | `--threshold <PERCENT>` | exit 2 below this score; `85`, `85.5`, and `85.50%` all parse |
 | `--reporter text\|json\|github` | repeatable |
 | `--cache` | reuse verdicts for unchanged packages |
-| `--list` | print the selected names, run nothing |
+| `--list` | print the selected names, and the selection reason on stderr when it widened |
 | `--jobs` / `--timeout` / `--manifest-path` | passed to `cargo-mutants` |
 | `--verbose` | echo each command on stderr |
 
@@ -149,13 +150,15 @@ score: 50.00% (1 detected, 1 missed, 0 accepted, 0 unviable, 0 not run)
 cache: 1 killed verdict reused, 0 survivors decided again
 ```
 
-A diff that only changed tests prints the reason the scope is wider than the functions it touched:
+A diff that changed something a function span cannot carry prints the reason the scope is wider than the functions it touched:
 
 ```
 mutator: 270 of 309 mutants in scope (diff since main)
 selection: 1 test file changed, so every mutant of mutator is in scope
   ...
 ```
+
+The text report never claims more than the selection proves. A score from a diff-scoped run measures the change, not the repository.
 
 `--reporter json` emits one document with a stable field order:
 
@@ -245,8 +248,11 @@ The gate runs on every push to `main` and every pull request, and the `diff` job
 
 ## Limits
 
-- Selection follows function spans. A change to a function pulls in every mutant of that function, which is intentional but coarser than a line-level filter when a function is large.
-- A test or manifest change widens the selection to whole packages, so a one-line test edit in a large crate runs all of that crate's mutants. `--all` is the explicit override for a wider sweep.
-- Ownership comes from `cargo metadata`. A changed test or manifest that no member owns, such as a workspace-level `tests/` directory or `Cargo.lock`, selects every mutant rather than guessing which package could observe it.
+Selective mutation testing is not equivalent to a full-workspace run. The guarantee runs one way: every path a diff touches that a function span cannot represent widens the selection until the mutants it can reach are measured. Nothing here proves the mutants outside the selection are killed.
+
+- Selection follows function spans inside function bodies. A change to a function pulls in every mutant of that function, which is intentional but coarser than a line-level filter when a function is large.
+- A source line outside every mutant's function, or a declaration inside one, widens to the whole package. The declaration test is a keyword scan, so it errs towards a wider run: a false positive costs time, while a missed caller would go unmeasured.
+- A test, source, build-script, or manifest change widens the selection to whole packages, so a one-line edit in a large crate runs all of that crate's mutants. A path the owning package cannot attribute, such as a workspace-level lockfile or `tests/` directory, selects every mutant. `--all` is the explicit override for a wider sweep.
+- Code generated into `OUT_DIR` by a build script, macro output, and `include!` of a file outside the crate are not modelled. A change to their generator is caught, a change to a file they read at build time is not.
 - The score covers mutants this run selected. It is a measurement of the change, not of the repository.
 - Reuse is per package. A workspace with one large crate gets less from `--cache` than one split into small crates.

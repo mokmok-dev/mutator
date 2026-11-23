@@ -43,3 +43,19 @@ fn a_missing_root_reports_the_path_and_exits_one() {
         "stdout: {stdout}"
     );
 }
+
+#[test]
+fn an_unreadable_diff_exits_one_and_names_the_file() {
+    let diff = std::env::temp_dir().join(format!("mutator-bad-{}.diff", std::process::id()));
+    if let Err(err) = std::fs::write(
+        &diff,
+        "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ broken @@\n",
+    ) {
+        panic!("the diff file is writable: {err}");
+    }
+    let output = mutator(&["--diff", diff.to_str().unwrap_or("x"), "--list"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("@@ broken @@"), "stdout: {stdout}");
+    let _ = std::fs::remove_file(&diff);
+}

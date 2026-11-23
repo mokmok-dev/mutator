@@ -33,7 +33,10 @@ const FINGERPRINT_VERSION: u32 = 2;
 const MUTANTS_CONFIG: &str = ".cargo/mutants.toml";
 
 /// Workspace-level files whose content decides what a package's tests build and run.
-const SHARED: [&str; 8] = [
+///
+/// A change to one also widens the selection to the whole workspace, since it
+/// decides more than the package that happens to contain it.
+pub(crate) const SHARED: [&str; 8] = [
     "Cargo.lock",
     "Cargo.toml",
     MUTANTS_CONFIG,

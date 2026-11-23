@@ -78,6 +78,11 @@ impl std::error::Error for ParseError {}
 pub struct Diff {
     files: BTreeMap<String, Vec<LineRange>>,
     paths: BTreeSet<String>,
+    /// Each added and removed line's new-side line and trimmed text, per file.
+    changed: BTreeMap<String, Vec<(u32, String)>>,
+    /// Paths the diff moved without a hunk describing them: a deletion, or either
+    /// side of a rename.
+    moved: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,35 +102,84 @@ impl Diff {
     pub fn parse(text: &str) -> Result<Self, ParseError> {
         let mut files = BTreeMap::<String, Vec<LineRange>>::new();
         let mut paths = BTreeSet::<String>::new();
+        let mut changed = BTreeMap::<String, Vec<(u32, String)>>::new();
+        let mut moved = BTreeSet::<String>::new();
         let mut path: Option<String> = None;
+        let mut old_side: Option<String> = None;
         let mut state = State::Header;
+        let mut next: Option<u32> = None;
         for (index, raw) in text.lines().enumerate() {
             if let Some(rest) = raw.strip_prefix("diff --git ") {
                 // A rename names both sides, and each one can hold a changed test.
                 if let Some((old, new)) = rest.rsplit_once(" b/") {
-                    paths.insert(old.strip_prefix("a/").unwrap_or(old).to_owned());
+                    let old = old.strip_prefix("a/").unwrap_or(old);
+                    paths.insert(old.to_owned());
                     paths.insert(new.to_owned());
                 }
                 path = rest.rsplit_once(" b/").map(|(_, new)| new.to_owned());
+                old_side = None;
                 state = State::Header;
             } else if state == State::Header && raw.starts_with("+++ ") {
                 // `+++ /dev/null` marks a deletion; `strip_prefix` then yields no path.
                 path = raw.strip_prefix("+++ b/").map(str::to_owned);
                 if let Some(new) = path.as_ref() {
                     paths.insert(new.clone());
+                } else if let Some(old) = old_side.take() {
+                    moved.insert(old);
                 }
+            } else if state == State::Header
+                && let Some(old) = raw.strip_prefix("rename from ")
+            {
+                moved.insert(old.to_owned());
+            } else if state == State::Header
+                && let Some(new) = raw.strip_prefix("rename to ")
+            {
+                // A rename changes the module path callers use, whatever its hunks say.
+                moved.insert(new.to_owned());
+            } else if state == State::Header
+                && let Some(old) = raw.strip_prefix("--- a/")
+            {
+                old_side = Some(old.to_owned());
             } else if let Some(rest) = raw.strip_prefix("@@ ") {
                 let range = parse_hunk(rest).ok_or_else(|| ParseError {
                     line: index.saturating_add(1),
                     text: raw.to_owned(),
                 })?;
                 state = State::Body;
+                next = Some(range.start);
                 if let Some(path) = path.as_ref() {
                     files.entry(path.clone()).or_default().push(range);
                 }
+            } else if state == State::Body
+                && let (Some(path), Some(line)) = (path.as_ref(), next.as_mut())
+            {
+                match raw.split_at_checked(1) {
+                    Some(("+", text)) => {
+                        changed
+                            .entry(path.clone())
+                            .or_default()
+                            .push((*line, text.trim().to_owned()));
+                        *line = line.saturating_add(1);
+                    }
+                    // A removed line never reaches the new side, so it carries the
+                    // line that now holds what followed it.
+                    Some(("-", text)) => changed
+                        .entry(path.clone())
+                        .or_default()
+                        .push((*line, text.trim().to_owned())),
+                    // Context advances the new side without changing it, and the
+                    // `\ No newline at end of file` marker advances neither.
+                    Some((" ", _)) => *line = line.saturating_add(1),
+                    _ => {}
+                }
             }
         }
-        Ok(Self { files, paths })
+        Ok(Self {
+            files,
+            paths,
+            changed,
+            moved,
+        })
     }
 
     pub fn files(&self) -> impl Iterator<Item = (&str, &[LineRange])> {
@@ -164,6 +218,28 @@ impl Diff {
             .into_iter()
             .flatten()
             .flat_map(|range| range.start..=range.end)
+    }
+
+    /// The new-side line and trimmed text of every added and removed line of `path`.
+    ///
+    /// Context lines are not changes, so they stay out: a selector reads this to
+    /// see what a hunk says, not what surrounds it. A removed line has no new-side
+    /// line of its own, so it carries the line it collapsed onto.
+    pub fn changed(&self, path: &str) -> impl Iterator<Item = (u32, &str)> + '_ {
+        self.changed
+            .get(path)
+            .into_iter()
+            .flatten()
+            .map(|(line, text)| (*line, text.as_str()))
+    }
+
+    /// Whether the diff moved `path` away without a hunk describing it: a deleted
+    /// file, or either side of a rename.
+    ///
+    /// No new-side line carries such a change, so no function span can hold it.
+    #[must_use]
+    pub fn moved(&self, path: &str) -> bool {
+        self.moved.contains(path)
     }
 }
 
@@ -236,6 +312,56 @@ mod tests {
         let text = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -5,2 +4,0 @@\n-x\n-y\n";
         let diff = Diff::parse(text).unwrap();
         assert_eq!(diff.lines("a.rs").collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn changed_text_skips_context_lines() {
+        let text = concat!(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,3 @@\n",
+            "-\told();\n",
+            " same();\n",
+            "+\tnew();\n",
+        );
+        let diff = Diff::parse(text).unwrap();
+        assert_eq!(
+            diff.changed("a.rs").collect::<Vec<_>>(),
+            vec![(1, "old();"), (2, "new();")]
+        );
+    }
+
+    #[test]
+    fn a_no_newline_marker_advances_no_line() {
+        let text = concat!(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n",
+            "-old();\n",
+            "+new();\n",
+            "\\ No newline at end of file\n",
+            "+next();\n",
+        );
+        let diff = Diff::parse(text).unwrap();
+        assert_eq!(
+            diff.changed("a.rs").collect::<Vec<_>>(),
+            vec![(1, "old();"), (1, "new();"), (2, "next();")]
+        );
+    }
+
+    #[test]
+    fn a_removed_line_carries_the_line_it_collapsed_onto() {
+        let text = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -5,2 +4,1 @@\n-gone();\n-alsogone();\n";
+        let diff = Diff::parse(text).unwrap();
+        assert_eq!(
+            diff.changed("a.rs").collect::<Vec<_>>(),
+            vec![(4, "gone();"), (4, "alsogone();")]
+        );
+    }
+
+    #[test]
+    fn changed_text_is_empty_for_a_file_without_a_hunk() {
+        let diff = Diff::parse("diff --git a/a.rs b/a.rs\n").unwrap();
+        assert_eq!(
+            diff.changed("a.rs").collect::<Vec<_>>(),
+            Vec::<(u32, &str)>::new()
+        );
     }
 
     #[test]
@@ -325,6 +451,12 @@ mod tests {
                     ranges.push(range);
                 }
                 diff.paths.insert(path.clone());
+                let changed: Vec<(u32, String)> = ranges
+                    .iter()
+                    .flat_map(|range| range.start..=range.end)
+                    .map(|line| (line, "changed();".to_owned()))
+                    .collect();
+                diff.changed.insert(path.clone(), changed);
                 diff.files.insert(path, ranges);
             }
             diff
