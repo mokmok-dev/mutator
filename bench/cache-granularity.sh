@@ -258,9 +258,11 @@ scenario() {
     fi
 
     # Join the base verdicts with the edited ones, so a verdict that flipped is kept
-    # apart from a mutant the edit created or removed.
+    # apart from a mutant the edit created or removed. `rows` sorts byte-wise, so
+    # `join` must compare byte-wise too: the caller's locale ignores the punctuation
+    # in an id such as `-1#0`, and refuses the input as unsorted.
     local joined flipped names added removed
-    joined=$(join -t $'\t' -a 1 -a 2 -e NONE -o 0,1.2,2.2 \
+    joined=$(LC_ALL=C join -t $'\t' -a 1 -a 2 -e NONE -o 0,1.2,2.2 \
         "$out/base.tsv" "$out/$name-reality.tsv")
     flipped=$(printf '%s\n' "$joined" |
         awk -F'\t' '$2 != "NONE" && $3 != "NONE" && $2 != $3' | wc -l)
