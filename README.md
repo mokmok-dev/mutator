@@ -15,7 +15,7 @@ A pull request runs only the mutants its diff can affect, and fails when one sur
 - **Exact selection.** The selected mutants reach `cargo-mutants` as one anchored regex, so a run tests those mutants and no neighbours. Verdicts come back from `mutants.out/outcomes.json` rather than from matching console text.
 - **Stable identity.** A mutant's id is `file::function::genre::replacement#ordinal`. Line numbers are not part of it, so editing above a mutant does not invalidate its accepted-equivalent entry.
 - **Accepted equivalents.** `mutator accept <id> --reason "…"` records a mutant no input can observe in `mutator.accepted.json`, which you commit. The entry leaves the score and the gate, and the report lists entries whose mutant is gone.
-- **A content-addressed cache.** `--cache` stores a verdict against a SHA-256 of everything that decides it, so an unchanged package costs a hash instead of a test run.
+- **A content-addressed cache.** `--cache` stores a verdict against a SHA-256 of everything that decides it, including the local packages it depends on, so an unchanged closure costs a hash instead of a test run.
 - **One gate.** `--fail-on-survived` and `--threshold` decide the exit code. Unrun mutants always fail: a run that could not decide a mutant has proved nothing.
 
 Inspired by [mizchi/mutator](https://github.com/mizchi/mutator), which does the same job for TypeScript on top of Vitest, Jest, and Bun.
@@ -192,13 +192,19 @@ The id comes from the report. An accepted entry is reported as `ACCEPTED`, stays
 
 ## The cache
 
-`--cache` stores each verdict under `target/mutator-cache/<package>/<fingerprint>.json`. The fingerprint covers every `.rs` file under the package's `src/`, `tests/`, `benches/` and `examples/`, its `Cargo.toml`, the workspace `Cargo.toml` and `Cargo.lock`, plus the `cargo-mutants` and `mutator` versions.
+`--cache` stores each verdict under `target/mutator-cache/<package>/<fingerprint>.json`. The fingerprint covers every file a package's tests can observe: everything under `src/`, `tests/`, `benches/` and `examples/` of the package and of every local package it depends on, their `Cargo.toml` and `build.rs`, the workspace `Cargo.toml`, `Cargo.lock`, `.cargo/mutants.toml`, `.cargo/config`, `.cargo/config.toml`, `.config/nextest.toml`, `rust-toolchain`, and `rust-toolchain.toml`, plus the `cargo-mutants` and `mutator` versions. Files are hashed by their path relative to the project root, so moving the checkout does not invalidate the cache.
 
-That is deliberately the whole package: `cargo-mutants` rebuilds and reruns a package's tests for each mutant, so any file in the package can change a verdict. The cost is that editing one test re-runs every mutant of that package. The benefit is that reuse needs no coverage data and can be wrong in only one direction: it decides nothing the tests would not have decided.
+The local dependency closure is the point. `cargo-mutants` runs `cargo test --package=<pkg>`, which builds and links every path dependency of that package, so a change to a dependency's implementation can change the dependent package's verdicts while its own files stay byte-for-byte identical. A registry dependency is not local: its contents cannot change without `Cargo.lock` changing, which the fingerprint already covers.
+
+That is deliberately the whole closure: `cargo-mutants` rebuilds and reruns a package's tests for each mutant, so any file in it can change a verdict. The cost is that editing one test re-runs every mutant of that package and its dependents. The benefit is that reuse needs no coverage data and can be wrong in only one direction: it decides nothing the tests would not have decided.
 
 A reused kill is reported as `KILLED` and counted exactly like a fresh one. A stored survivor still runs, since a survivor means "no test observed this mutant" and a new test can change that without touching the package's source. Nothing is read or written without the flag.
 
-A changed test or manifest that no package owns, such as a workspace-level `tests/` directory or `Cargo.lock`, turns reuse off for that run. The run cannot tell which stores the file could change, so it decides every selected verdict again instead of trusting one.
+When a package's inputs cannot be modelled, the run decides it again instead of reusing a verdict, and says so on stderr. That covers a package whose dependencies `cargo metadata` does not resolve. A changed test or manifest that no package owns, such as a workspace-level `tests/` directory or `Cargo.lock`, turns reuse off for the whole run, since it cannot tell which stores the file could change.
+
+`.cargo/mutants.toml` can widen a run in ways a fingerprint cannot follow. `test_workspace = true` makes every mutant test the whole workspace, so the key being present puts every local package in every closure. Other keys still apply, and `additional_cargo_args` or `additional_cargo_test_args` naming files outside the closure are not fingerprinted.
+
+Some inputs cannot be fingerprinted at all, so a verdict is never claimed to be fresh against them: the installed compiler and standard library, when no `rust-toolchain.toml` pins them; environment variables a test or build script reads; files a test or build script opens by an absolute path or from outside the closure; and anything outside the tree. The cache is a speedup, not a substitute for a cold run on a new toolchain.
 
 Measured on this crate: 2m48s cold, 10.8s warm, 270 of 270 verdicts reused, identical score.
 

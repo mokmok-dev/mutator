@@ -377,7 +377,8 @@ impl Session<'_> {
     /// Split the selection into reused verdicts and work that still needs a run.
     ///
     /// A mutant is reused only when its package's fingerprint matches a stored
-    /// entry. Killed mutants are settled from the store. Survivors are decided
+    /// entry, and the fingerprint covers the package's whole local dependency
+    /// closure. Killed mutants are settled from the store. Survivors are decided
     /// again so a new test can kill them, since a survivor only means that no
     /// test observed it.
     fn decide<'a>(
@@ -387,12 +388,19 @@ impl Session<'_> {
         accepted: &Accepted,
     ) -> Result<Decision<'a>> {
         let cargo_mutants = cache::cargo_mutants_version(self.exec, root)?;
-        let dirs = cache::package_dirs(root, self.exec)?;
+        let local = cache::packages(root, self.exec)?;
         let mut hits = Hits::default();
         let mut packages = Vec::new();
-        for (package, dir) in &dirs {
-            let files = cache::fingerprint_sources(root, dir);
-            let fingerprint = cache::fingerprint(package, &files, &cargo_mutants)?;
+        for (package, dir) in &local {
+            if let Some(reason) = &dir.opaque {
+                let _ = writeln!(
+                    self.err,
+                    "mutator: not reusing verdicts for {package}: {reason}"
+                );
+                continue;
+            }
+            let files = cache::fingerprint_sources(dir);
+            let fingerprint = cache::fingerprint(root, package, &files, &cargo_mutants)?;
             hits.extend(&cache::load(root, package, &fingerprint, &cargo_mutants));
             packages.push(Learned {
                 package: package.clone(),
@@ -424,7 +432,9 @@ impl Session<'_> {
     /// Write what this run learned, so the next unchanged package hits.
     ///
     /// Mutants decided by this run replace their stored verdict. Mutants it left
-    /// out keep theirs, so a killed mutant does not become pending again.
+    /// out keep theirs, so a killed mutant does not become pending again. A package
+    /// with no fingerprint is opaque, so nothing is written for it: a store nothing
+    /// could safely read back would only be dead weight.
     fn store(&mut self, root: &Path, decision: &Decision<'_>, records: &[Record]) -> Result<()> {
         let by_name: BTreeMap<&str, Outcome> = records
             .iter()
@@ -550,12 +560,13 @@ impl Session<'_> {
 
     /// Each workspace member's directory, relative to the project root.
     fn packages(&mut self, root: &Path) -> Result<BTreeMap<String, PathBuf>> {
-        Ok(cache::package_dirs(root, self.exec)?
+        Ok(cache::packages(root, self.exec)?
             .into_iter()
-            .map(|(name, dir)| {
-                let relative = dir
+            .map(|(name, package)| {
+                let relative = package
+                    .dir
                     .strip_prefix(root)
-                    .map_or_else(|_| dir.clone(), Path::to_path_buf);
+                    .map_or_else(|_| package.dir.clone(), Path::to_path_buf);
                 (name, relative)
             })
             .collect())
@@ -700,9 +711,13 @@ mod tests {
     /// `cargo metadata` output for one package whose manifest sits in `dir`.
     fn metadata_json(root: &Path, dir: &str, package: &str) -> String {
         let manifest = root.join(dir).join("Cargo.toml");
+        let id = format!("path+file://{}#0.1.0", root.join(dir).display());
         format!(
-            r#"{{"packages":[{{"name":"{package}","manifest_path":"{}"}}]}}"#,
-            manifest.display()
+            r#"{{"packages":[{{"id":"{id}","name":"{package}","source":null,"manifest_path":"{}"}}],
+               "resolve":{{"nodes":[{{"id":"{id}","dependencies":[]}}]}},
+               "workspace_root":"{}"}}"#,
+            manifest.display(),
+            root.display()
         )
     }
 
@@ -1132,6 +1147,10 @@ mod tests {
         runs_started: RefCell<Vec<Vec<String>>>,
         /// Where `cargo metadata` says the one package's manifest sits, relative to the root.
         package_dir: &'static str,
+        /// The `cargo metadata` document to serve, instead of the one-package default.
+        metadata: Option<String>,
+        /// The `cargo mutants --list` document to serve.
+        list: &'static str,
     }
 
     impl CacheFake {
@@ -1145,6 +1164,22 @@ mod tests {
                 ),
                 runs_started: RefCell::new(Vec::new()),
                 package_dir: "",
+                metadata: None,
+                list: CACHE_LIST,
+            }
+        }
+
+        /// Serve `metadata` and `list`, for a project with more than one package.
+        fn workspace(
+            root: &Path,
+            metadata: String,
+            list: &'static str,
+            runs: Vec<(i32, &str)>,
+        ) -> Self {
+            Self {
+                metadata: Some(metadata),
+                list,
+                ..Self::new(root, runs)
             }
         }
     }
@@ -1152,21 +1187,28 @@ mod tests {
     impl Exec for CacheFake {
         fn run(&self, program: &str, args: &[String], _cwd: &Path) -> Result<Output> {
             if program == "cargo" && args.first().is_some_and(|a| a == "metadata") {
-                let name = self
-                    .root
-                    .join(self.package_dir)
+                if let Some(metadata) = &self.metadata {
+                    return Ok(ok(metadata));
+                }
+                let dir = self.root.join(self.package_dir);
+                let id = format!("path+file://{}#0.1.0", dir.display());
+                let manifest = dir
                     .join("Cargo.toml")
                     .to_str()
                     .map_or_else(String::new, str::to_owned);
                 return Ok(ok(&format!(
-                    r#"{{"packages":[{{"name":"cachepkg","manifest_path":"{name}"}}]}}"#
+                    r#"{{"packages":[{{"id":"{id}","name":"cachepkg","source":null,
+                        "manifest_path":"{manifest}"}}],
+                       "resolve":{{"nodes":[{{"id":"{id}","dependencies":[]}}]}},
+                       "workspace_root":"{}"}}"#,
+                    dir.display()
                 )));
             }
             if args.iter().any(|arg| arg == "--version") {
                 return Ok(ok("cargo-mutants 27.1.0\n"));
             }
             if args.iter().any(|arg| arg == "--list") {
-                return Ok(ok(CACHE_LIST));
+                return Ok(ok(self.list));
             }
             if args.iter().any(|arg| arg == "--output") {
                 self.runs_started.borrow_mut().push(args.to_vec());
@@ -1210,6 +1252,22 @@ mod tests {
     fn killed(name: &str) -> String {
         format!(
             r#"{{"outcomes":[{{"scenario":"Baseline","summary":"Success"}},{{"scenario":{{"Mutant":{{"name":"{name}"}}}},"summary":"CaughtMutant"}}]}}"#
+        )
+    }
+
+    /// One `cargo mutants` answer that kills every name, since one call may carry several.
+    fn killed_all(names: &[&str]) -> String {
+        let records: Vec<String> = names
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"scenario":{{"Mutant":{{"name":"{name}"}}}},"summary":"CaughtMutant"}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"outcomes":[{{"scenario":"Baseline","summary":"Success"}},{}]}}"#,
+            records.join(",")
         )
     }
 
@@ -1270,6 +1328,220 @@ mod tests {
             second.runs_started.borrow().len(),
             1,
             "the change must force a run"
+        );
+        assert!(!text.contains("reused"), "{text}");
+    }
+
+    /// A workspace with `app` and `core`, where `app` depends on `core` by path.
+    fn workspace_project(name: &str) -> PathBuf {
+        let root = temp_root(&format!("cache-ws-{name}"));
+        for package in ["app", "core"] {
+            let dir = root.join("crates").join(package);
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("src/lib.rs"), format!("pub fn {package}() {{}}\n")).unwrap();
+            let dependency = if package == "app" {
+                "\n[dependencies]\ncore = { path = \"../core\" }\n"
+            } else {
+                ""
+            };
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{dependency}"
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/core\"]\nresolver = \"3\"\n",
+        )
+        .unwrap();
+        root
+    }
+
+    /// `cargo metadata` for `workspace_project`, with the dependency edge app -> core.
+    fn workspace_metadata(root: &Path) -> String {
+        let app = root.join("crates/app");
+        let core = root.join("crates/core");
+        let app_id = format!("path+file://{}#0.1.0", app.display());
+        let core_id = format!("path+file://{}#0.1.0", core.display());
+        format!(
+            r#"{{"packages":[
+                {{"id":"{app_id}","name":"app","source":null,
+                  "manifest_path":"{}"}},
+                {{"id":"{core_id}","name":"core","source":null,
+                  "manifest_path":"{}"}}],
+               "resolve":{{"nodes":[
+                {{"id":"{app_id}","dependencies":["{core_id}"]}},
+                {{"id":"{core_id}","dependencies":[]}}]}},
+               "workspace_root":"{}"}}"#,
+            app.join("Cargo.toml").display(),
+            core.join("Cargo.toml").display(),
+            root.display()
+        )
+    }
+
+    /// One mutant in each package, named for the package it lives in.
+    const WORKSPACE_LIST: &str = r#"[
+      {"name":"app::m","file":"crates/app/src/lib.rs","package":"app","genre":"FnValue",
+       "replacement":"0",
+       "span":{"start":{"line":1,"column":1},"end":{"line":1,"column":2}},
+       "function":{"function_name":"app","return_type":"-> ()",
+                   "span":{"start":{"line":1,"column":1},"end":{"line":3,"column":2}}}},
+      {"name":"core::m","file":"crates/core/src/lib.rs","package":"core","genre":"FnValue",
+       "replacement":"0",
+       "span":{"start":{"line":1,"column":1},"end":{"line":1,"column":2}},
+       "function":{"function_name":"core","return_type":"-> ()",
+                   "span":{"start":{"line":1,"column":1},"end":{"line":3,"column":2}}}}
+    ]"#;
+
+    #[test]
+    fn a_dependency_change_invalidates_the_dependent_package_too() {
+        let root = workspace_project("dep-change");
+        let both = killed_all(&["app::m", "core::m"]);
+        execute_str(
+            &cached_run(&root, &[]),
+            &CacheFake::workspace(
+                &root,
+                workspace_metadata(&root),
+                WORKSPACE_LIST,
+                vec![(0, both.as_str())],
+            ),
+        );
+        std::fs::write(
+            root.join("crates/core/src/lib.rs"),
+            "pub fn core() { let _ = 1; }\n",
+        )
+        .unwrap();
+
+        let second = CacheFake::workspace(
+            &root,
+            workspace_metadata(&root),
+            WORKSPACE_LIST,
+            vec![(0, both.as_str())],
+        );
+        let (code, text) = execute_str(&cached_run(&root, &[]), &second);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            !text.contains("verdict reused"),
+            "nothing may be reused: {text}"
+        );
+        let names: Vec<String> = second
+            .runs_started
+            .borrow()
+            .iter()
+            .flat_map(|args| selected_names(args))
+            .collect();
+        assert!(names.contains(&"app::m".to_owned()), "{names:?}");
+        assert!(names.contains(&"core::m".to_owned()), "{names:?}");
+    }
+
+    #[test]
+    fn an_unrelated_package_still_reuses_its_verdicts() {
+        let root = workspace_project("unrelated");
+        let both = killed_all(&["app::m", "core::m"]);
+        execute_str(
+            &cached_run(&root, &[]),
+            &CacheFake::workspace(
+                &root,
+                workspace_metadata(&root),
+                WORKSPACE_LIST,
+                vec![(0, both.as_str())],
+            ),
+        );
+        // app depends on core, so changing app cannot change core's verdicts.
+        std::fs::write(
+            root.join("crates/app/src/lib.rs"),
+            "pub fn app() { let _ = 1; }\n",
+        )
+        .unwrap();
+
+        let second = CacheFake::workspace(
+            &root,
+            workspace_metadata(&root),
+            WORKSPACE_LIST,
+            vec![(0, killed("app::m").as_str())],
+        );
+        let (code, text) = execute_str(&cached_run(&root, &[]), &second);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("1 killed verdict reused"), "{text}");
+        let names: Vec<String> = second
+            .runs_started
+            .borrow()
+            .iter()
+            .flat_map(|args| selected_names(args))
+            .collect();
+        assert_eq!(names, vec!["app::m".to_owned()], "only app must rerun");
+    }
+
+    #[test]
+    fn a_build_configuration_change_invalidates_every_package() {
+        let root = workspace_project("config-change");
+        let both = killed_all(&["app::m", "core::m"]);
+        execute_str(
+            &cached_run(&root, &[]),
+            &CacheFake::workspace(
+                &root,
+                workspace_metadata(&root),
+                WORKSPACE_LIST,
+                vec![(0, both.as_str())],
+            ),
+        );
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"--cfg\", \"extra\"]\n",
+        )
+        .unwrap();
+
+        let second = CacheFake::workspace(
+            &root,
+            workspace_metadata(&root),
+            WORKSPACE_LIST,
+            vec![(0, both.as_str())],
+        );
+        let (code, text) = execute_str(&cached_run(&root, &[]), &second);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            !text.contains("verdict reused"),
+            "a new rustflag changes what every test builds: {text}"
+        );
+        assert_eq!(
+            second.runs_started.borrow().len(),
+            1,
+            "every package must run again: {text}"
+        );
+    }
+
+    #[test]
+    fn a_package_whose_dependency_graph_is_unknown_is_never_reused() {
+        let root = cache_project("opaque");
+        let metadata = format!(
+            r#"{{"packages":[{{"id":"path+file://{}#0.1.0","name":"cachepkg",
+                "source":null,"manifest_path":"{}"}}],"resolve":null,
+                "workspace_root":"{}"}}"#,
+            root.display(),
+            root.join("Cargo.toml").display(),
+            root.display()
+        );
+        let first = CacheFake {
+            metadata: Some(metadata.clone()),
+            ..CacheFake::new(&root, vec![(0, killed("m1").as_str())])
+        };
+        let (code, text) = execute_str(&cached_run(&root, &[]), &first);
+        assert_eq!(code, 0, "{text}");
+
+        let second = CacheFake {
+            metadata: Some(metadata),
+            ..CacheFake::new(&root, vec![(0, killed("m1").as_str())])
+        };
+        let (code, text) = execute_str(&cached_run(&root, &["--fail-on-survived"]), &second);
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(
+            second.runs_started.borrow().len(),
+            1,
+            "an unknown closure must not reuse a verdict: {text}"
         );
         assert!(!text.contains("reused"), "{text}");
     }
