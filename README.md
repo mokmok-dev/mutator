@@ -201,6 +201,24 @@ The local dependency closure is the point. `cargo-mutants` runs `cargo test --pa
 
 That is deliberately the whole closure: `cargo-mutants` rebuilds and reruns a package's tests for each mutant, so any file in it can change a verdict. The cost is that editing one test re-runs every mutant of that package and its dependents. The benefit is that reuse needs no coverage data and can be wrong in only one direction: it decides nothing the tests would not have decided.
 
+### Why the key stops at the package
+
+A finer key was prototyped and rejected on measurement, not on taste. `bench/cache-granularity.sh` warms the cache on a three-crate workspace, then edits one function, one test, one module with no mutants, one dependency, and one dependency's test file, each from the same base. Every run is compared against an uncached run of the same tree, and the script fails if the verdicts differ.
+
+| change | reused | verdicts flipped in files the edit never touched |
+|---|---|---|
+| one function in the root package | 13 of 34 | 0 |
+| one test file of the root package | 13 of 34 | 3, all in `app/src/lib.rs` |
+| a module of the root package with no mutants | 13 of 36 | 3, all in `app/src/lib.rs` |
+| one function of a dependency | 0 of 35 | 3, all in `app/src/lib.rs` |
+| one test file of a dependency | 7 of 34 | 3, all in `util/src/lib.rs` |
+
+The last four rows are the reason nothing finer ships. A key built from a mutant and its own file would have reused every stale verdict in them, because a verdict depends on every value the tests compute, and those values live in other files. Two edges make it worse than a coverage tool would suggest. A `#[test]` lives in the package's own `tests/`, so no test-level key can separate "the mutant changed" from "the assertion changed". And a dependency's `tests/` file is still reachable as data: a library may `include!` it, which flips a dependent's verdict with no source file of that dependent changing.
+
+The one-function row is where a finer key would pay, and the fixture cannot prove it would be sound. The edit flipped no verdict there, but that is one change to one function. Nothing in a function edit stops it from flipping a verdict for a mutant in a different function: a test that calls both functions computes its assertion from both, so editing one moves the other's verdict. A per-function key would need coverage evidence that no test observes the edited function together with a mutant's function, and where that evidence is missing it would fall back to the package anyway. That evidence is the coverage data this cache is designed to avoid.
+
+What the prototype did establish is the shape of the trade. The cheapest sound key is the package, and the warm-run floor on this crate sits in `cargo-mutants`' unviable recompiles, not in fingerprinting.
+
 A reused kill is reported as `KILLED` and counted exactly like a fresh one. A stored survivor still runs, since a survivor means "no test observed this mutant" and a new test can change that without touching the package's source. Nothing is read or written without the flag.
 
 When a package's inputs cannot be modelled, the run decides it again instead of reusing a verdict, and says so on stderr. That covers a package whose dependencies `cargo metadata` does not resolve. A changed test or manifest that no package owns, such as a workspace-level `tests/` directory or `Cargo.lock`, turns reuse off for the whole run, since it cannot tell which stores the file could change.
@@ -209,7 +227,11 @@ When a package's inputs cannot be modelled, the run decides it again instead of 
 
 Some inputs cannot be fingerprinted at all, so a verdict is never claimed to be fresh against them: the installed compiler and standard library, when no `rust-toolchain.toml` pins them; environment variables a test or build script reads; files a test or build script opens by an absolute path or from outside the closure; and anything outside the tree. The cache is a speedup, not a substitute for a cold run on a new toolchain.
 
-Measured on this crate: 2m48s cold, 10.8s warm, 270 of 270 verdicts reused, identical score.
+Measured on this crate: 2m48s cold, 10.8s warm, 270 of 270 verdicts reused, identical score. The warm run's floor is not fingerprinting. The three subprocess calls a warm run makes to find its work (`cargo mutants --list --json`, `cargo metadata`, `cargo mutants --version`) take 0.16s together, and hashing the closure is smaller still. A warm run takes 17.6s here, and 17.7s of a separate measurement is `cargo-mutants` rebuilding the 54 unviable mutants, which produce no compilable mutation to test but are re-emitted by every run and stored by none. A finer cache key would not touch that floor.
+
+The counts behind that, from `mutator --all --cache` on this crate: 398 mutants, 344 verdicts reused, 54 unviable. Timing `cargo mutants` over exactly those 54 names alone takes 17.7s, so the warm run is that recompile plus about 0.2s of bookkeeping.
+
+The benchmark is `bench/cache-granularity.sh`, and it fails if a cached run ever disagrees with an uncached run of the same tree.
 
 For CI, cache the directory and let it restore across runs:
 

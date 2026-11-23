@@ -1384,6 +1384,30 @@ mod tests {
         assert!(!text.contains("reused"), "{text}");
     }
 
+    #[test]
+    fn a_module_with_no_mutant_still_invalidates_the_package() {
+        let root = cache_project("sibling-file");
+        std::fs::write(root.join("src/lib.rs"), "pub mod other;\n\npub fn f() {}\n").unwrap();
+        std::fs::write(root.join("src/other.rs"), "pub fn k() -> i32 { 1 }\n").unwrap();
+        execute_str(
+            &cached_run(&root, &[]),
+            &CacheFake::new(&root, vec![(0, killed("m1").as_str())]),
+        );
+        // No mutant lives in `other.rs`, but a test of this package can compare against
+        // what `k` returns, which decides whether `f`'s mutant is caught.
+        std::fs::write(root.join("src/other.rs"), "pub fn k() -> i32 { -5 }\n").unwrap();
+
+        let second = CacheFake::new(&root, vec![(0, killed("m1").as_str())]);
+        let (code, text) = execute_str(&cached_run(&root, &[]), &second);
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(
+            second.runs_started.borrow().len(),
+            1,
+            "a file no mutant lives in still decides this mutant's verdict: {text}"
+        );
+        assert!(!text.contains("reused"), "{text}");
+    }
+
     /// A workspace with `app` and `core`, where `app` depends on `core` by path.
     fn workspace_project(name: &str) -> PathBuf {
         let root = temp_root(&format!("cache-ws-{name}"));
@@ -1487,6 +1511,52 @@ mod tests {
             .collect();
         assert!(names.contains(&"app::m".to_owned()), "{names:?}");
         assert!(names.contains(&"core::m".to_owned()), "{names:?}");
+    }
+
+    #[test]
+    fn a_dependency_test_file_invalidates_the_dependent_package() {
+        let root = workspace_project("dep-test-change");
+        let both = killed_all(&["app::m", "core::m"]);
+        execute_str(
+            &cached_run(&root, &[]),
+            &CacheFake::workspace(
+                &root,
+                workspace_metadata(&root),
+                WORKSPACE_LIST,
+                vec![(0, both.as_str())],
+            ),
+        );
+        // A dependency's `tests/` file can be reached as data: its library may
+        // `include!` it, so it decides app's verdicts without any app file changing.
+        std::fs::create_dir_all(root.join("crates/core/tests")).unwrap();
+        std::fs::write(
+            root.join("crates/core/tests/fixture.rs"),
+            "pub fn k() -> i32 { 1 }\n",
+        )
+        .unwrap();
+
+        let second = CacheFake::workspace(
+            &root,
+            workspace_metadata(&root),
+            WORKSPACE_LIST,
+            vec![(0, both.as_str())],
+        );
+        let (code, text) = execute_str(&cached_run(&root, &[]), &second);
+        assert_eq!(code, 0, "{text}");
+        let names: Vec<String> = second
+            .runs_started
+            .borrow()
+            .iter()
+            .flat_map(|args| selected_names(args))
+            .collect();
+        assert!(
+            names.contains(&"app::m".to_owned()),
+            "a dependency's test file can change app's verdicts: {names:?}"
+        );
+        assert!(
+            names.contains(&"core::m".to_owned()),
+            "core's own test file changes its verdicts: {names:?}"
+        );
     }
 
     #[test]
