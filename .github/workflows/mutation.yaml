@@ -45,9 +45,9 @@ jobs:
           key: mutator-cache-self-${{ github.run_id }}
           restore-keys: |
             mutator-cache-self-
-      - run: nix develop --command cargo build
+      - run: nix develop ./dev --command cargo build
       - name: Mutation gate
-        run: nix develop --command ./target/debug/mutator --cache --fail-on-survived
+        run: nix develop ./dev --command ./target/debug/mutator --cache --fail-on-survived
 
   # The flake exposes the binary as `packages.<system>.default` and as
   # `apps.<system>.default`, so a consumer can take it as an input. Every system
@@ -88,12 +88,12 @@ jobs:
           restore-keys: |
             mutator-cache-pr-
             mutator-cache-self-
-      - run: nix develop --command cargo build
+      - run: nix develop ./dev --command cargo build
       # Annotations go to stdout for the diff view, and the step summary carries the
       # metrics a reviewer reads without opening the log. The exit code is the gate.
       - name: Run the mutants this diff can affect
         run: |
-          nix develop --command ./target/debug/mutator \
+          nix develop ./dev --command ./target/debug/mutator \
             --since "origin/${{ github.base_ref }}" \
             --cache \
             --fail-on-survived \
@@ -111,11 +111,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
-      - run: nix develop --command cargo build
+      - run: nix develop ./dev --command cargo build
       - name: Cache granularity benchmark
         run: |
           {
             echo '## Mutation cache benchmark'
             echo
-            nix develop --command env ROUNDS=3 bash bench/cache-granularity.sh
+            nix develop ./dev --command env ROUNDS=3 bash bench/cache-granularity.sh
           } | tee -a "$GITHUB_STEP_SUMMARY"

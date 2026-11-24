@@ -75,12 +75,26 @@ in
     }:
     let
       cfg = config.mutator;
-      craneLib = inputs.mutator.inputs.crane.mkLib pkgs;
-      src = craneLib.cleanCargoSource cfg.source;
-      cargoVendorDir = craneLib.vendorCargoDeps { inherit src; };
-      cargoArtifacts = craneLib.buildDepsOnly {
-        inherit src cargoVendorDir;
+      # Only cargo sources, so a local `source` does not drag `target/` in.
+      src = lib.cleanSourceWith {
+        src = cfg.source;
+        filter =
+          path: type:
+          type == "directory"
+          || lib.hasSuffix ".rs" path
+          || lib.hasSuffix ".toml" path
+          || lib.hasSuffix "Cargo.lock" path;
       };
+      vendor = pkgs.rustPlatform.importCargoLock { lockFile = cfg.source + "/Cargo.lock"; };
+      # `cargo-mutants` shells out to `cargo`, which reads source replacement from
+      # `CARGO_HOME` rather than from the copied project.
+      cargoConfig = pkgs.writeText "cargo-config.toml" ''
+        [source.crates-io]
+        replace-with = "vendored-sources"
+
+        [source.vendored-sources]
+        directory = "${vendor}"
+      '';
     in
     lib.mkIf cfg.enable {
       packages.mutator = cfg.package;
@@ -111,14 +125,12 @@ in
             cp -r ${src} work
             chmod -R u+w work
             cd work
-            mkdir -p target
-            cp -r ${cargoArtifacts}/target/. target/ 2>/dev/null || true
 
             export HOME=$TMPDIR
             export CARGO_HOME=$TMPDIR/cargo
-            # `cleanCargoSource` rewrites `.cargo/config.toml` to use the vendored
-            # sources; cargo reads that from the vendor dir, not from `CARGO_HOME`.
-            export CARGO_VENDOR_DIR=${cargoVendorDir}
+            mkdir -p $CARGO_HOME
+            cp ${cargoConfig} $CARGO_HOME/config.toml
+
             ${cfg.package}/bin/mutator \
               ${
                 lib.escapeShellArgs (

@@ -24,7 +24,7 @@
 #   flips none *in this fixture*, which is not a proof that a function-level key is
 #   sound: a mutant's verdict depends on every value its tests compute.
 #
-# Usage: bench/cache-granularity.sh   (from `nix develop`, or with MUTATOR=<path>)
+# Usage: bench/cache-granularity.sh   (from `nix develop ./dev`, or with MUTATOR=<path>)
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -32,7 +32,7 @@ mutator=${MUTATOR:-$repo/target/debug/mutator}
 jobs=${JOBS:-4}
 
 [[ -x $mutator ]] || {
-    echo "build the binary first: nix develop --command cargo build" >&2
+    echo "build the binary first: nix develop ./dev --command cargo build" >&2
     exit 1
 }
 command -v jq >/dev/null || {
