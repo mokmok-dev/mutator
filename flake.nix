@@ -1,173 +1,66 @@
 {
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs";
-    flake-parts.url = "github:hercules-ci/flake-parts";
-    flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
-    git-hooks.url = "github:cachix/git-hooks.nix";
-    git-hooks.inputs.nixpkgs.follows = "nixpkgs";
-    treefmt-nix.url = "github:numtide/treefmt-nix";
-    treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
-    rust-overlay.url = "github:oxalica/rust-overlay";
-    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
-    crane.url = "github:ipetkov/crane";
-  };
+  description = "Diff-driven mutation testing for Rust, built on cargo-mutants";
+
+  # The published flake carries the package and the module, so it depends on
+  # nixpkgs alone. Development tooling lives in ./dev.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs";
 
   outputs =
     {
+      self,
       nixpkgs,
-      flake-parts,
-      git-hooks,
-      treefmt-nix,
-      rust-overlay,
-      crane,
       ...
-    }@inputs:
-    flake-parts.lib.mkFlake { inherit inputs; } {
-      imports = [
-        git-hooks.flakeModule
-        treefmt-nix.flakeModule
-      ];
-
-      flake = {
-        # `imports = [ inputs.mutator.flakeModules.default ]` then
-        # `perSystem.mutator = { enable = true; check = true; };`
-        flakeModules.default = ./nix/mutator-module.nix;
-      };
-
-      perSystem =
-        {
-          pkgs,
-          system,
-          ...
-        }:
-        let
-          rustToolchain = pkgs.rust-bin.stable.latest.default;
-          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-          src = craneLib.cleanCargoSource ./.;
-          commonArgs = {
-            inherit src;
-            strictDeps = true;
-          };
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-          linkerPackages = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
-            with pkgs;
-            [
-              clang
-              mold
-            ]
-          );
-          linkerEnv = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-            export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
-            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="clang"
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="clang"
-          '';
-
-          # The binary a consumer gets from `inputs.mutator.packages.<system>.default`.
-          mutator = craneLib.buildPackage (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              cargoBuildCommand = "cargo build --release --package mutator";
-              cargoExtraArgs = "--package mutator";
-              doCheck = false;
-              meta = {
-                description = "Diff-driven mutation testing for Rust on top of cargo-mutants";
-                license = pkgs.lib.licenses.mit;
-                mainProgram = "mutator";
-              };
-            }
-          );
-        in
-        {
-          _module.args.pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ rust-overlay.overlays.default ];
-          };
-
-          apps = {
-            default = {
-              type = "app";
-              program = "${mutator}/bin/mutator";
-              meta.description = "Diff-driven mutation testing for Rust";
-            };
-            mutator = {
-              type = "app";
-              program = "${mutator}/bin/mutator";
-              meta.description = "Diff-driven mutation testing for Rust";
-            };
-          };
-
-          checks = {
-            clippy = craneLib.cargoClippy (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
-              }
-            );
-            fmt = craneLib.cargoFmt (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-              }
-            );
-            test = craneLib.cargoTest (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-              }
-            );
-          };
-
-          devShells.default = pkgs.mkShellNoCC {
-            packages = with pkgs; [
-              actionlint
-              cargo-mutants
-              cargo-nextest
-              deadnix
-              jq
-              linkerPackages
-              nixfmt
-              nixfmt-tree
-              rustToolchain
-              sccache
-              skills
-              statix
-            ];
-
-            shellHook = ''
-              export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
-              ${linkerEnv}
-            '';
-          };
-
-          packages = {
-            default = mutator;
-            inherit mutator;
-          };
-
-          pre-commit.settings = {
-            hooks = {
-              actionlint.enable = true;
-              deadnix.enable = true;
-              statix.enable = true;
-            };
-            package = pkgs.prek;
-          };
-
-          treefmt = {
-            projectRootFile = "flake.nix";
-            programs = {
-              nixfmt.enable = true;
-            };
-          };
-        };
-
+    }:
+    let
       systems = [
-        "aarch64-linux"
         "aarch64-darwin"
+        "aarch64-linux"
         "x86_64-linux"
       ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+
+      mutator =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "mutator";
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          doCheck = false;
+          meta = {
+            description = "Diff-driven mutation testing for Rust on top of cargo-mutants";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "mutator";
+          };
+        };
+    in
+    {
+      packages = forAllSystems (
+        system:
+        let
+          package = mutator (import nixpkgs { inherit system; });
+        in
+        {
+          default = package;
+          mutator = package;
+        }
+      );
+
+      apps = forAllSystems (
+        system:
+        let
+          app = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/mutator";
+            meta.description = "Diff-driven mutation testing for Rust";
+          };
+        in
+        {
+          default = app;
+          mutator = app;
+        }
+      );
+
+      flakeModules.default = ./nix/mutator-module.nix;
     };
 }

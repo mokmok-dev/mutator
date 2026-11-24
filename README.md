@@ -41,7 +41,7 @@ As a flake input:
 packages = [ inputs.mutator.packages.${system}.default ];
 ```
 
-From a checkout, `nix build` and `nix run . -- --version` do the same. `nix develop` gives you the toolchain, `cargo-mutants`, and `cargo-nextest`.
+From a checkout, `nix build` and `nix run . -- --version` do the same. The published flake depends on nixpkgs alone, so it carries the package and the module and nothing else. Development tooling lives in [`dev/`](dev/flake.nix): `nix develop ./dev` gives you the toolchain, `cargo-mutants`, and `cargo-nextest`.
 
 Supported systems are `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`. Nixpkgs 26.11 dropped `x86_64-darwin`, so Intel Macs are not covered.
 
@@ -87,7 +87,7 @@ the gate to stay inside a few seconds.
 
 ### Development
 
-`nix develop` gives you the toolchain, `cargo-mutants`, `cargo-nextest`, and the linters. `nix fmt` formats; `nix flake check` runs every check, one per linter, so a failure names the tool that failed.
+`nix develop ./dev` gives you the toolchain, `cargo-mutants`, `cargo-nextest`, and the linters. `nix flake check ./dev` runs every check, one per linter, so a failure names the tool that failed. The formatter lives there too, and `cd dev && nix fmt` formats the whole repository.
 
 ### Agent skills
 
@@ -262,9 +262,9 @@ A pull request job that runs the diff, annotates survivors, and writes the step 
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0            # --since needs the base commit
-- run: nix develop --command cargo build
+- run: nix develop ./dev --command cargo build
 - run: |
-    nix develop --command ./target/debug/mutator \
+    nix develop ./dev --command ./target/debug/mutator \
       --since "origin/${{ github.base_ref }}" \
       --cache --fail-on-survived \
       --reporter github --summary "$GITHUB_STEP_SUMMARY"
