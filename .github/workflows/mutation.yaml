@@ -72,10 +72,15 @@ jobs:
       - run: nix run .#packages.${{ matrix.system }}.default -- --version
 
   # The tool's reason to exist: PRs run only the mutants their diff can affect.
+  #
+  # A diff that touches no function span, such as an attribute or an import,
+  # widens the scope to the whole package by design, so this job occasionally
+  # carries the same 428 mutants the `self` job does. That job needed 38 minutes
+  # cold; the budget here is sized past it so a wide diff is not cancelled.
   diff:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
