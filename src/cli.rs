@@ -204,6 +204,7 @@ fn parse_fraction(text: &str, fraction: &str) -> std::result::Result<u32, String
     })
 }
 
+#[must_use]
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     let stdout = std::io::stdout();
