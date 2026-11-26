@@ -2,7 +2,11 @@
   description = "Development environment for mutator";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs";
+    # Following the published flake's nixpkgs is what keeps the dev shell's Rust
+    # the same as the one that builds `packages.default`.
+    root.url = "path:..";
+
+    nixpkgs.follows = "root/nixpkgs";
 
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
@@ -19,11 +23,6 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
     crane.url = "github:ipetkov/crane";
   };
 
@@ -32,7 +31,6 @@
       flake-parts,
       git-hooks,
       treefmt-nix,
-      rust-overlay,
       crane,
       ...
     }@inputs:
@@ -43,14 +41,9 @@
       ];
 
       perSystem =
-        {
-          pkgs,
-          system,
-          ...
-        }:
+        { pkgs, ... }:
         let
-          rustToolchain = pkgs.rust-bin.stable.latest.default;
-          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+          craneLib = crane.mkLib pkgs;
           src = craneLib.cleanCargoSource ./..;
           commonArgs = {
             inherit src;
@@ -72,11 +65,6 @@
           '';
         in
         {
-          _module.args.pkgs = import inputs.nixpkgs {
-            inherit system;
-            overlays = [ rust-overlay.overlays.default ];
-          };
-
           checks = {
             clippy = craneLib.cargoClippy (
               commonArgs
@@ -97,19 +85,40 @@
                 inherit cargoArtifacts;
               }
             );
+            # `nixpkgs` follows the root flake, but a root bump does not
+            # re-resolve this lock. Without this check the dev shell would keep
+            # an older rustc than `packages.default` and nothing would say so.
+            nixpkgs-aligned =
+              let
+                rootRev = (builtins.fromJSON (builtins.readFile ../flake.lock)).nodes.nixpkgs.locked.rev;
+                devRev = (builtins.fromJSON (builtins.readFile ./flake.lock)).nodes.nixpkgs.locked.rev;
+              in
+              pkgs.runCommandLocal "nixpkgs-aligned" { } (
+                if rootRev == devRev then
+                  "touch $out"
+                else
+                  ''
+                    echo "dev/flake.lock pins nixpkgs ${devRev}, but flake.lock has ${rootRev}." >&2
+                    echo "Run 'nix flake update' at the root, then 'nix flake update --flake ./dev'." >&2
+                    exit 1
+                  ''
+              );
           };
 
           devShells.default = pkgs.mkShellNoCC {
             packages = with pkgs; [
               actionlint
+              cargo
               cargo-mutants
               cargo-nextest
+              clippy
               deadnix
               jq
               linkerPackages
               nixfmt
               nixfmt-tree
-              rustToolchain
+              rustc
+              rustfmt
               sccache
               skills
               statix

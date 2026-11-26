@@ -89,6 +89,8 @@ the gate to stay inside a few seconds.
 
 `nix develop ./dev` gives you the toolchain, `cargo-mutants`, `cargo-nextest`, and the linters. `nix flake check ./dev` runs every check, one per linter, so a failure names the tool that failed. The formatter lives there too, and `cd dev && nix fmt` formats the whole repository.
 
+The dev shell uses nixpkgs' rustc, the same one `nix build` compiles the package with, so the shell and the published binary are the same compiler. `dev/flake.nix` follows the root flake's nixpkgs, and `checks.nixpkgs-aligned` fails when the two lock files disagree. After bumping the root, run `nix flake update --flake ./dev`.
+
 ### Agent skills
 
 The repository ships skills under [`skills/`](skills/), so an agent can close the gaps this tool finds:
