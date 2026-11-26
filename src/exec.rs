@@ -28,20 +28,17 @@ pub trait Exec {
     /// Returns when the program cannot be started or its streams cannot be read.
     fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<Output>;
 
-    /// Runs a program, forwarding its stdout to `sink` a line at a time.
+    /// Runs a program, writing each line of its stdout to `sink` as it arrives.
     ///
-    /// The default replays the captured stdout line by line, because a fake has
-    /// nothing to stream while it answers and a command that cannot stream has
-    /// only its finished output to report. [`Real`] forwards each line while the
-    /// child still runs, so a long run shows progress instead of silence.
+    /// The default replays the captured stdout line by line once the program has
+    /// exited. [`Real`] forwards each line while the child still runs.
     ///
-    /// A sink that refuses a line does not fail the run: the caller's stream may
-    /// be closed, and the child's verdict still matters.
+    /// A sink that refuses a line does not fail the run.
     ///
     /// # Errors
     ///
     /// Returns when the program cannot be started or its streams cannot be read.
-    fn run_streaming(
+    fn run_stdout_to(
         &self,
         program: &str,
         args: &[String],
@@ -57,11 +54,19 @@ pub trait Exec {
 /// Runs the real process, capturing both streams.
 pub struct Real;
 
+/// The one way this crate starts a child process.
+///
+/// An explicit null stdin matches what [`Command::output`] does implicitly, so
+/// both a captured run and a streamed one give the child the same stdin.
+fn command(program: &str, args: &[String], cwd: &Path) -> Command {
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd).stdin(Stdio::null());
+    command
+}
+
 impl Exec for Real {
     fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<Output> {
-        let output = Command::new(program)
-            .args(args)
-            .current_dir(cwd)
+        let output = command(program, args, cwd)
             .output()
             .map_err(|source| Error::Spawn {
                 program: program.to_owned(),
@@ -74,19 +79,14 @@ impl Exec for Real {
         })
     }
 
-    fn run_streaming(
+    fn run_stdout_to(
         &self,
         program: &str,
         args: &[String],
         cwd: &Path,
         sink: &mut dyn Write,
     ) -> Result<Output> {
-        let mut child = Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            // `Command::output` closes stdin, so match it: a child that reads
-            // stdin must see end of input, not this process's terminal.
-            .stdin(Stdio::null())
+        let mut child = command(program, args, cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -124,16 +124,12 @@ impl Exec for Real {
 }
 
 /// Copies `reader` to `sink` one line at a time, returning the whole text.
-///
-/// A complete line is flushed before the next one is read, so a consumer sees it
-/// while the writer still runs. A final line with no newline is forwarded too.
 fn pump(mut reader: impl BufRead, sink: &mut dyn Write) -> std::io::Result<String> {
     let mut text = String::new();
     let mut bytes = Vec::new();
     loop {
         bytes.clear();
         reader.read_until(b'\n', &mut bytes)?;
-        // End of input is the only case that leaves the buffer empty.
         if bytes.is_empty() {
             return Ok(text);
         }
@@ -165,8 +161,7 @@ pub fn list_args(manifest: Option<&Path>) -> Vec<String> {
 
 /// A `cargo mutants` run restricted to exactly `names`.
 ///
-/// `caught` adds `-v` (`--caught`), which prints one line per caught mutant, so a
-/// streaming run shows every verdict as it lands instead of only the survivors.
+/// `caught` adds `-v` (`--caught`), which prints one line per caught mutant.
 ///
 /// # Errors
 ///
@@ -281,7 +276,6 @@ mod tests {
         assert!(caught.iter().any(|arg| arg == "-v"), "{caught:?}");
     }
 
-    /// Every write as the sink received it, so a test can see the line boundaries.
     #[derive(Default)]
     struct Lines(Vec<String>);
 
@@ -312,7 +306,6 @@ mod tests {
         );
     }
 
-    /// A fake with no way to stream, so the trait's own body answers.
     struct Captured(&'static str);
 
     impl Exec for Captured {
@@ -326,11 +319,11 @@ mod tests {
     }
 
     #[test]
-    fn the_default_run_streaming_replays_the_captured_stdout() {
+    fn the_default_replays_the_captured_stdout_line_by_line() {
         let captured = "ok       Unmutated baseline\nMISSED   src/lib.rs:1:34: replace + with *\n";
         let mut sink = Lines::default();
         let output = Captured(captured)
-            .run_streaming("cargo", &[], Path::new("."), &mut sink)
+            .run_stdout_to("cargo", &[], Path::new("."), &mut sink)
             .unwrap();
         assert_eq!(
             sink.0,

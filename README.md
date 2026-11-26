@@ -129,7 +129,7 @@ mutator --since main --cache --fail-on-survived
 
 `--jobs` and `--timeout` pass straight through to `cargo-mutants` as `-j` and `-t`. `--manifest-path` selects a workspace member. `--verbose` echoes each command on stderr, keeping stdout parseable.
 
-`cargo-mutants` progress goes to stderr while the run is still going, one line per finished mutant, so a long run shows it is alive. `--quiet` turns that off. stdout carries only the report, so `--reporter json` and `--reporter github` stay parseable either way.
+`cargo-mutants` prints one progress line per finished mutant as it runs, and `mutator` forwards those lines to stderr, so a long run shows it is alive. `--quiet` turns the forwarding off. stdout carries only the report, so `--reporter json` and `--reporter github` stay parseable either way.
 
 ### Options
 
@@ -145,7 +145,7 @@ mutator --since main --cache --fail-on-survived
 | `--list` | print the selected names, and the selection reason on stderr when it widened |
 | `--jobs` / `--timeout` / `--manifest-path` | passed to `cargo-mutants` |
 | `--verbose` | echo each command on stderr |
-| `--quiet` | suppress `cargo-mutants` progress on stderr |
+| `--quiet` | stop forwarding `cargo-mutants` progress to stderr |
 
 ### Reports
 

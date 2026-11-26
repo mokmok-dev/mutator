@@ -85,7 +85,7 @@ pub struct Project {
     #[arg(long, short, global = true)]
     pub verbose: bool,
 
-    /// Suppress progress from `cargo-mutants` on stderr.
+    /// Stop forwarding `cargo-mutants` progress to stderr.
     #[arg(long, short, global = true)]
     pub quiet: bool,
 
@@ -650,12 +650,10 @@ impl Session<'_> {
                 !self.project.quiet,
             )?;
             self.announce("cargo", &args);
-            // Progress goes straight to stderr, with no prefix, so `cargo-mutants`
-            // keeps its column alignment and stdout stays the report alone.
             let output = if self.project.quiet {
                 self.exec.run("cargo", &args, root)?
             } else {
-                self.exec.run_streaming("cargo", &args, root, self.err)?
+                self.exec.run_stdout_to("cargo", &args, root, self.err)?
             };
             let mutants_out = out_dir.join("mutants.out");
             let outcomes_path = mutants_out.join("outcomes.json");
@@ -794,7 +792,6 @@ mod tests {
         all_caught: bool,
         /// Where `cargo metadata` says the one package's manifest sits, relative to the root.
         package_dir: &'static str,
-        /// What a `cargo mutants` run prints on stdout, as its progress lines.
         progress: &'static str,
     }
 
