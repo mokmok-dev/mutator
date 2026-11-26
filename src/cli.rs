@@ -85,6 +85,10 @@ pub struct Project {
     #[arg(long, short, global = true)]
     pub verbose: bool,
 
+    /// Suppress progress from `cargo-mutants` on stderr.
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
+
     /// Passed through as `cargo mutants -j`.
     #[arg(long, global = true)]
     pub jobs: Option<u32>,
@@ -643,9 +647,16 @@ impl Session<'_> {
                 self.project.manifest_path.as_deref(),
                 self.project.jobs,
                 self.project.timeout,
+                !self.project.quiet,
             )?;
             self.announce("cargo", &args);
-            let output = self.exec.run("cargo", &args, root)?;
+            // Progress goes straight to stderr, with no prefix, so `cargo-mutants`
+            // keeps its column alignment and stdout stays the report alone.
+            let output = if self.project.quiet {
+                self.exec.run("cargo", &args, root)?
+            } else {
+                self.exec.run_streaming("cargo", &args, root, self.err)?
+            };
             let mutants_out = out_dir.join("mutants.out");
             let outcomes_path = mutants_out.join("outcomes.json");
             if output.code == BASELINE_FAILED {
@@ -783,6 +794,8 @@ mod tests {
         all_caught: bool,
         /// Where `cargo metadata` says the one package's manifest sits, relative to the root.
         package_dir: &'static str,
+        /// What a `cargo mutants` run prints on stdout, as its progress lines.
+        progress: &'static str,
     }
 
     impl Fake {
@@ -799,6 +812,7 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 all_caught: false,
                 package_dir: "",
+                progress: "",
             }
         }
 
@@ -893,7 +907,7 @@ mod tests {
             std::fs::write(dir.join("outcomes.json"), json)?;
             Ok(Output {
                 code,
-                stdout: String::new(),
+                stdout: self.progress.to_owned(),
                 stderr: "run stderr".to_owned(),
             })
         }
@@ -929,6 +943,57 @@ mod tests {
         let mut err = Vec::new();
         let code = execute(run, fake, &mut out, &mut err).unwrap_or_else(|err| panic!("{err:#}"));
         (code, String::from_utf8(out).unwrap())
+    }
+
+    fn execute_split(run: &Run, fake: &dyn Exec) -> (i32, String, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = execute(run, fake, &mut out, &mut err).unwrap_or_else(|err| panic!("{err:#}"));
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    const PROGRESS: &str = "ok       Unmutated baseline\n\
+        caught   src/lib.rs:3:5: replace parse -> u32 with 0\n\
+        caught   src/lib.rs:20:5: replace render -> u32 with 0\n";
+
+    #[test]
+    fn a_run_streams_the_progress_to_stderr_and_keeps_stdout_a_report() {
+        let root = temp_root("streaming");
+        let fake = Fake {
+            progress: PROGRESS,
+            ..Fake::new(LIST, vec![(0, BOTH)], vec![])
+        };
+        let (code, out, err) = execute_split(&run_at(&root, &[]), &fake);
+        assert_eq!(code, 0);
+        assert_eq!(err, PROGRESS, "progress reaches stderr unchanged");
+        assert!(
+            out.starts_with("mutator: 2 of 2 mutants in scope"),
+            "stdout is the report alone: {out}"
+        );
+        assert!(!out.contains("Unmutated baseline"), "{out}");
+        let runs = fake.run_calls();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].iter().any(|arg| arg == "-v"), "{:?}", runs[0]);
+    }
+
+    #[test]
+    fn a_quiet_run_streams_nothing_and_asks_for_no_verdict_lines() {
+        let root = temp_root("quiet-progress");
+        let fake = Fake {
+            progress: PROGRESS,
+            ..Fake::new(LIST, vec![(0, BOTH)], vec![])
+        };
+        let (code, out, err) = execute_split(&run_at(&root, &["--quiet"]), &fake);
+        assert_eq!(code, 0);
+        assert_eq!(err, "");
+        assert!(out.starts_with("mutator: 2 of 2 mutants in scope"), "{out}");
+        let runs = fake.run_calls();
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].iter().any(|arg| arg == "-v"), "{:?}", runs[0]);
     }
 
     #[test]

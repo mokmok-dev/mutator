@@ -1,7 +1,8 @@
 //! The one process seam: every external command goes through [`Exec`].
 
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
 
@@ -26,6 +27,31 @@ pub trait Exec {
     ///
     /// Returns when the program cannot be started or its streams cannot be read.
     fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<Output>;
+
+    /// Runs a program, forwarding its stdout to `sink` a line at a time.
+    ///
+    /// The default replays the captured stdout line by line, because a fake has
+    /// nothing to stream while it answers and a command that cannot stream has
+    /// only its finished output to report. [`Real`] forwards each line while the
+    /// child still runs, so a long run shows progress instead of silence.
+    ///
+    /// A sink that refuses a line does not fail the run: the caller's stream may
+    /// be closed, and the child's verdict still matters.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the program cannot be started or its streams cannot be read.
+    fn run_streaming(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        sink: &mut dyn Write,
+    ) -> Result<Output> {
+        let output = self.run(program, args, cwd)?;
+        let _ = pump(std::io::Cursor::new(output.stdout.as_str()), sink);
+        Ok(output)
+    }
 }
 
 /// Runs the real process, capturing both streams.
@@ -46,6 +72,74 @@ impl Exec for Real {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    fn run_streaming(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        sink: &mut dyn Write,
+    ) -> Result<Output> {
+        let mut child = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            // `Command::output` closes stdin, so match it: a child that reads
+            // stdin must see end of input, not this process's terminal.
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| Error::Spawn {
+                program: program.to_owned(),
+                source,
+            })?;
+        // Drain stderr on its own thread. A full stderr pipe blocks the child, and
+        // the progress on stdout would stop with it.
+        let stderr = child.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+        });
+        let stdout = child.stdout.take().map_or_else(
+            || Ok(String::new()),
+            |pipe| pump(BufReader::new(pipe), sink),
+        );
+        let status = child.wait().map_err(|source| Error::Spawn {
+            program: program.to_owned(),
+            source,
+        })?;
+        let stdout = stdout.map_err(|source| Error::Spawn {
+            program: program.to_owned(),
+            source,
+        })?;
+        Ok(Output {
+            code: exit_code(status),
+            stdout,
+            stderr: stderr.map_or_else(String::new, |handle| handle.join().unwrap_or_default()),
+        })
+    }
+}
+
+/// Copies `reader` to `sink` one line at a time, returning the whole text.
+///
+/// A complete line is flushed before the next one is read, so a consumer sees it
+/// while the writer still runs. A final line with no newline is forwarded too.
+fn pump(mut reader: impl BufRead, sink: &mut dyn Write) -> std::io::Result<String> {
+    let mut text = String::new();
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        reader.read_until(b'\n', &mut bytes)?;
+        // End of input is the only case that leaves the buffer empty.
+        if bytes.is_empty() {
+            return Ok(text);
+        }
+        let _ = sink.write_all(&bytes);
+        let _ = sink.flush();
+        text.push_str(&String::from_utf8_lossy(&bytes));
     }
 }
 
@@ -71,6 +165,9 @@ pub fn list_args(manifest: Option<&Path>) -> Vec<String> {
 
 /// A `cargo mutants` run restricted to exactly `names`.
 ///
+/// `caught` adds `-v` (`--caught`), which prints one line per caught mutant, so a
+/// streaming run shows every verdict as it lands instead of only the survivors.
+///
 /// # Errors
 ///
 /// Returns when `names` is empty, since nothing could then be selected.
@@ -80,6 +177,7 @@ pub fn run_args(
     manifest: Option<&Path>,
     jobs: Option<u32>,
     timeout: Option<u64>,
+    caught: bool,
 ) -> Result<Vec<String>> {
     let mut args = vec![
         "mutants".to_owned(),
@@ -91,6 +189,9 @@ pub fn run_args(
         "--re".to_owned(),
         select_regex(names)?,
     ];
+    if caught {
+        args.push("-v".to_owned());
+    }
     if let Some(path) = manifest {
         args.push("--manifest-path".to_owned());
         args.push(path.display().to_string());
@@ -154,13 +255,91 @@ mod tests {
 
     #[test]
     fn run_args_carry_the_output_directory_and_the_regex() {
-        let args = run_args(&["x"], Path::new("/tmp/out"), None, Some(2), Some(30)).unwrap();
+        let args = run_args(
+            &["x"],
+            Path::new("/tmp/out"),
+            None,
+            Some(2),
+            Some(30),
+            false,
+        )
+        .unwrap();
         let text = args.join(" ");
         assert!(text.contains("--output /tmp/out"));
         assert!(text.contains("--re ^(?:x)$"));
         assert!(text.contains("-j 2"));
         assert!(text.contains("-t 30"));
         assert!(!text.contains("--manifest-path"));
+    }
+
+    #[test]
+    fn run_args_print_every_verdict_only_when_asked() {
+        let quiet = run_args(&["x"], Path::new("/tmp/out"), None, None, None, false).unwrap();
+        assert!(!quiet.iter().any(|arg| arg == "-v"), "{quiet:?}");
+
+        let caught = run_args(&["x"], Path::new("/tmp/out"), None, None, None, true).unwrap();
+        assert!(caught.iter().any(|arg| arg == "-v"), "{caught:?}");
+    }
+
+    /// Every write as the sink received it, so a test can see the line boundaries.
+    #[derive(Default)]
+    struct Lines(Vec<String>);
+
+    impl Write for Lines {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.push(String::from_utf8_lossy(buffer).into_owned());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pump_forwards_each_line_and_returns_the_whole_text() {
+        let text = "ok       Unmutated baseline\ncaught   src/lib.rs:1:45: replace + with -\nnone";
+        let mut sink = Lines::default();
+        let whole = pump(std::io::Cursor::new(text), &mut sink).unwrap();
+        assert_eq!(whole, text);
+        assert_eq!(
+            sink.0,
+            [
+                "ok       Unmutated baseline\n",
+                "caught   src/lib.rs:1:45: replace + with -\n",
+                "none",
+            ]
+        );
+    }
+
+    /// A fake with no way to stream, so the trait's own body answers.
+    struct Captured(&'static str);
+
+    impl Exec for Captured {
+        fn run(&self, _program: &str, _args: &[String], _cwd: &Path) -> Result<Output> {
+            Ok(Output {
+                code: 0,
+                stdout: self.0.to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn the_default_run_streaming_replays_the_captured_stdout() {
+        let captured = "ok       Unmutated baseline\nMISSED   src/lib.rs:1:34: replace + with *\n";
+        let mut sink = Lines::default();
+        let output = Captured(captured)
+            .run_streaming("cargo", &[], Path::new("."), &mut sink)
+            .unwrap();
+        assert_eq!(
+            sink.0,
+            [
+                "ok       Unmutated baseline\n",
+                "MISSED   src/lib.rs:1:34: replace + with *\n",
+            ]
+        );
+        assert_eq!(output.stdout, captured);
     }
 
     #[test]
