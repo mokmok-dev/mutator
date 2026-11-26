@@ -1,7 +1,8 @@
 //! The one process seam: every external command goes through [`Exec`].
 
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
 
@@ -26,16 +27,46 @@ pub trait Exec {
     ///
     /// Returns when the program cannot be started or its streams cannot be read.
     fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<Output>;
+
+    /// Runs a program, writing each line of its stdout to `sink` as it arrives.
+    ///
+    /// The default replays the captured stdout line by line once the program has
+    /// exited. [`Real`] forwards each line while the child still runs.
+    ///
+    /// A sink that refuses a line does not fail the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the program cannot be started or its streams cannot be read.
+    fn run_stdout_to(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        sink: &mut dyn Write,
+    ) -> Result<Output> {
+        let output = self.run(program, args, cwd)?;
+        let _ = pump(std::io::Cursor::new(output.stdout.as_str()), sink);
+        Ok(output)
+    }
 }
 
 /// Runs the real process, capturing both streams.
 pub struct Real;
 
+/// The one way this crate starts a child process.
+///
+/// An explicit null stdin matches what [`Command::output`] does implicitly, so
+/// both a captured run and a streamed one give the child the same stdin.
+fn command(program: &str, args: &[String], cwd: &Path) -> Command {
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd).stdin(Stdio::null());
+    command
+}
+
 impl Exec for Real {
     fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<Output> {
-        let output = Command::new(program)
-            .args(args)
-            .current_dir(cwd)
+        let output = command(program, args, cwd)
             .output()
             .map_err(|source| Error::Spawn {
                 program: program.to_owned(),
@@ -46,6 +77,65 @@ impl Exec for Real {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    fn run_stdout_to(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        sink: &mut dyn Write,
+    ) -> Result<Output> {
+        let mut child = command(program, args, cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| Error::Spawn {
+                program: program.to_owned(),
+                source,
+            })?;
+        // Drain stderr on its own thread. A full stderr pipe blocks the child, and
+        // the progress on stdout would stop with it.
+        let stderr = child.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+        });
+        let stdout = child.stdout.take().map_or_else(
+            || Ok(String::new()),
+            |pipe| pump(BufReader::new(pipe), sink),
+        );
+        let status = child.wait().map_err(|source| Error::Spawn {
+            program: program.to_owned(),
+            source,
+        })?;
+        let stdout = stdout.map_err(|source| Error::Spawn {
+            program: program.to_owned(),
+            source,
+        })?;
+        Ok(Output {
+            code: exit_code(status),
+            stdout,
+            stderr: stderr.map_or_else(String::new, |handle| handle.join().unwrap_or_default()),
+        })
+    }
+}
+
+/// Copies `reader` to `sink` one line at a time, returning the whole text.
+fn pump(mut reader: impl BufRead, sink: &mut dyn Write) -> std::io::Result<String> {
+    let mut text = String::new();
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        reader.read_until(b'\n', &mut bytes)?;
+        if bytes.is_empty() {
+            return Ok(text);
+        }
+        let _ = sink.write_all(&bytes);
+        let _ = sink.flush();
+        text.push_str(&String::from_utf8_lossy(&bytes));
     }
 }
 
@@ -71,6 +161,8 @@ pub fn list_args(manifest: Option<&Path>) -> Vec<String> {
 
 /// A `cargo mutants` run restricted to exactly `names`.
 ///
+/// `caught` adds `-v` (`--caught`), which prints one line per caught mutant.
+///
 /// # Errors
 ///
 /// Returns when `names` is empty, since nothing could then be selected.
@@ -80,6 +172,7 @@ pub fn run_args(
     manifest: Option<&Path>,
     jobs: Option<u32>,
     timeout: Option<u64>,
+    caught: bool,
 ) -> Result<Vec<String>> {
     let mut args = vec![
         "mutants".to_owned(),
@@ -91,6 +184,9 @@ pub fn run_args(
         "--re".to_owned(),
         select_regex(names)?,
     ];
+    if caught {
+        args.push("-v".to_owned());
+    }
     if let Some(path) = manifest {
         args.push("--manifest-path".to_owned());
         args.push(path.display().to_string());
@@ -154,13 +250,89 @@ mod tests {
 
     #[test]
     fn run_args_carry_the_output_directory_and_the_regex() {
-        let args = run_args(&["x"], Path::new("/tmp/out"), None, Some(2), Some(30)).unwrap();
+        let args = run_args(
+            &["x"],
+            Path::new("/tmp/out"),
+            None,
+            Some(2),
+            Some(30),
+            false,
+        )
+        .unwrap();
         let text = args.join(" ");
         assert!(text.contains("--output /tmp/out"));
         assert!(text.contains("--re ^(?:x)$"));
         assert!(text.contains("-j 2"));
         assert!(text.contains("-t 30"));
         assert!(!text.contains("--manifest-path"));
+    }
+
+    #[test]
+    fn run_args_print_every_verdict_only_when_asked() {
+        let quiet = run_args(&["x"], Path::new("/tmp/out"), None, None, None, false).unwrap();
+        assert!(!quiet.iter().any(|arg| arg == "-v"), "{quiet:?}");
+
+        let caught = run_args(&["x"], Path::new("/tmp/out"), None, None, None, true).unwrap();
+        assert!(caught.iter().any(|arg| arg == "-v"), "{caught:?}");
+    }
+
+    #[derive(Default)]
+    struct Lines(Vec<String>);
+
+    impl Write for Lines {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.push(String::from_utf8_lossy(buffer).into_owned());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pump_forwards_each_line_and_returns_the_whole_text() {
+        let text = "ok       Unmutated baseline\ncaught   src/lib.rs:1:45: replace + with -\nnone";
+        let mut sink = Lines::default();
+        let whole = pump(std::io::Cursor::new(text), &mut sink).unwrap();
+        assert_eq!(whole, text);
+        assert_eq!(
+            sink.0,
+            [
+                "ok       Unmutated baseline\n",
+                "caught   src/lib.rs:1:45: replace + with -\n",
+                "none",
+            ]
+        );
+    }
+
+    struct Captured(&'static str);
+
+    impl Exec for Captured {
+        fn run(&self, _program: &str, _args: &[String], _cwd: &Path) -> Result<Output> {
+            Ok(Output {
+                code: 0,
+                stdout: self.0.to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn the_default_replays_the_captured_stdout_line_by_line() {
+        let captured = "ok       Unmutated baseline\nMISSED   src/lib.rs:1:34: replace + with *\n";
+        let mut sink = Lines::default();
+        let output = Captured(captured)
+            .run_stdout_to("cargo", &[], Path::new("."), &mut sink)
+            .unwrap();
+        assert_eq!(
+            sink.0,
+            [
+                "ok       Unmutated baseline\n",
+                "MISSED   src/lib.rs:1:34: replace + with *\n",
+            ]
+        );
+        assert_eq!(output.stdout, captured);
     }
 
     #[test]
